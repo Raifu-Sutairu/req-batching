@@ -1,0 +1,57 @@
+{
+  "REINFORCE": {
+    "mean_reward": -8.486807155611956,
+    "std_reward": 1.0754260977656025,
+    "mean_batch_size": 2.7381735762474118,
+    "mean_wait_time": 0.277965185153423,
+    "mean_throughput": 4.965999950340072
+  },
+  "A2C": {
+    "mean_reward": -1.7591420960882995,
+    "std_reward": 0.5804066834363243,
+    "mean_batch_size": 1.7692513500387328,
+    "mean_wait_time": 0.17217137574161093,
+    "mean_throughput": 5.012499949875071
+  },
+  "PPO": {
+    "mean_reward": -1.8232588846370543,
+    "std_reward": 0.3754655212592177,
+    "mean_batch_size": 1.7627938929861884,
+    "mean_wait_time": 0.1713101236290633,
+    "mean_throughput": 5.027499949725071
+  },
+  "DQN": {
+    "mean_reward": -1.810427222222091,
+    "std_reward": 0.5461865671582914,
+    "mean_batch_size": 1.7655247040841389,
+    "mean_wait_time": 0.1716501411068892,
+    "mean_throughput": 4.984999950150071
+  },
+  "Fixed Batch": {
+    "mean_reward": -31.835362855641826,
+    "std_reward": 1.539771311108532,
+    "mean_batch_size": 11.036178085199825,
+    "mean_wait_time": 1.1277617205230737,
+    "mean_throughput": 4.99299995007007,
+    "total_requests": 499.3,
+    "total_batches": 45.25
+  },
+  "Fixed Wait": {
+    "mean_reward": -20.863737621984733,
+    "std_reward": 0.787214177701469,
+    "mean_batch_size": 6.493991596788732,
+    "mean_wait_time": 0.6843278174349157,
+    "mean_throughput": 4.94499995055007,
+    "total_requests": 494.5,
+    "total_batches": 76.15
+  },
+  "Random": {
+    "mean_reward": -16.635848993491596,
+    "std_reward": 1.4184659409251759,
+    "mean_batch_size": 2.437646808558789,
+    "mean_wait_time": 0.326766886900146,
+    "mean_throughput": 4.9839999501600705,
+    "total_requests": 498.4,
+    "total_batches": 204.7
+  }
+}
