@@ -1,0 +1,26 @@
+[
+  {
+    "agent": "SAC+LSTM+PER",
+    "mean_reward": 1060.9394353839539,
+    "std_reward": 202.67252529382375,
+    "mean_batch_size": 1.0654751838542302,
+    "mean_wait_time": 7.430742562406339,
+    "mean_serve_rate": 0.75458
+  },
+  {
+    "agent": "Greedy",
+    "mean_reward": 1084.3994362456035,
+    "std_reward": 209.72407058932313,
+    "mean_batch_size": 1.0421882943043175,
+    "mean_wait_time": 4.9981259614112075,
+    "mean_serve_rate": 1.0
+  },
+  {
+    "agent": "Random",
+    "mean_reward": 999.2421277161183,
+    "std_reward": 201.10206019695858,
+    "mean_batch_size": 1.1366755353927818,
+    "mean_wait_time": 15.166138030887792,
+    "mean_serve_rate": 0.5000766666666667
+  }
+]

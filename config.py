@@ -67,7 +67,7 @@ DQN_CONFIG = {
 
 RPPO_CONFIG = {
     "learning_rate": 3e-4,
-    "gamma": 0.99, 
+    "gamma": 0.99,
     "gae_lambda": 0.95,
     "clip_range": 0.2,
     "ent_coef": 0.01,
@@ -76,11 +76,112 @@ RPPO_CONFIG = {
 
     "lstm_hidden_size": 64,
     "n_lstm_layers": 1,
-    "enable_critic_lstm":True,
+    "enable_critic_lstm": True,
     "n_steps": 128,
     "batch_size": 64,
-    "n_epochs":10,
+    "n_epochs": 10,
     "net_arch": dict(pi=[64], vf=[64]),
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# SAC + LSTM + PER Hyperparameters
+# ───────────────────────────────────────────────────────────────────────────
+#
+# Design rationale:
+#   - SAC is off-policy + entropy-regularised. It reuses experience from
+#     the replay buffer (unlike PPO which discards after each update).
+#     This makes it significantly more sample-efficient than PPO.
+#
+#   - LSTM seq_len=20: at decision_interval_ms=10ms, this covers
+#     200ms of traffic history — enough to detect burst onsets and
+#     regime changes without excessive memory overhead.
+#
+#   - PER alpha=0.6: moderate prioritisation. Pure uniform (0.0) ignores
+#     transition importance; full priority (1.0) can destabilise training
+#     by over-focusing on a small set of high-error transitions.
+#
+#   - target_entropy=-1.0: standard SAC recommendation of -dim(action_space).
+#     With 2 actions (Wait/Serve), this is -1.0. The agent will maintain
+#     ~nats of entropy — enough to stay exploratory without being random.
+#
+#   - tau=0.005: slow polyak averaging for target network updates.
+#     Much slower than DQN_CONFIG's hard update (tau=1.0), which is
+#     appropriate because SAC updates every step rather than every 1000.
+#
+# Tuning guide:
+#   alpha_reward ↑  →  agent prefers larger batches (higher throughput)
+#   beta_reward  ↑  →  agent more aggressively avoids long waits (lower latency)
+#   seq_len      ↑  →  more temporal context but slower training
+#   per_alpha    ↑  →  stronger prioritisation of surprising transitions
+
+SAC_CONFIG = {
+    # ── Environment interface ──────────────────────────────────────────
+    # These must match CONFIG above so SAC and PPO use the same environment
+    "state_dim":   6,       # [pending_requests, oldest_wait_ms, request_rate,
+                            #  since_serve_ms, batch_fill_ratio, time_of_day]
+    "action_dim":  2,       # 0 = Wait, 1 = Serve
+
+    # ── Reward weights ─────────────────────────────────────────────────
+    # Mirror CONFIG["alpha"] and CONFIG["beta"] for a fair comparison.
+    # You can override these independently here to tune SAC separately.
+    "alpha_reward": CONFIG["alpha"],     # batch efficiency weight  (= 1.0)
+    "beta_reward":  CONFIG["beta"],      # latency penalty weight   (= 0.01)
+
+    # ── SAC core ───────────────────────────────────────────────────────
+    "learning_rate":    3e-4,   # Adam LR — same as RPPO for fair comparison
+    "gamma":            0.99,   # discount factor — same as PPO/DQN
+    "tau":              0.005,  # soft target update rate (polyak averaging)
+                                # θ_target ← τ·θ + (1-τ)·θ_target each step
+    "alpha_init":       0.2,    # initial entropy temperature
+                                # quickly overridden by automatic tuning
+    "target_entropy":  -1.0,   # desired policy entropy = -dim(action_space)
+                                # auto-tuning keeps H(π) ≈ this value
+
+    # ── LSTM architecture ──────────────────────────────────────────────
+    "seq_len":       20,    # timesteps of history fed to LSTM
+                            # 20 steps × 10ms = 200ms of traffic context
+    "lstm_hidden":   256,   # LSTM hidden state size
+    "fc_hidden":     128,   # FC layer size after LSTM output
+
+    # ── Replay buffer (PER) ────────────────────────────────────────────
+    "buffer_capacity":  100_000,  # max transitions stored
+                                  # larger than DQN (64k) — SAC is off-policy
+                                  # and benefits from diverse historical data
+    "batch_size":       256,      # training minibatch size
+                                  # larger than DQN/PPO — SAC is more stable
+    "warm_up_steps":    1_000,    # random actions before training starts
+                                  # fills buffer with diverse initial data
+    "updates_per_step": 1,        # gradient updates per environment step
+
+    # PER-specific
+    "per_alpha":        0.6,      # prioritisation exponent
+                                  # 0 = uniform sampling (standard replay)
+                                  # 1 = fully prioritised (only high-error)
+    "per_beta_start":   0.4,      # IS weight exponent — anneals to 1.0
+                                  # corrects sampling bias from prioritisation
+    "per_beta_frames":  100_000,  # steps over which beta anneals to 1.0
+
+    # ── Training schedule ──────────────────────────────────────────────
+    "num_episodes":   400,    # total training episodes
+                              # fewer than PPO (500k steps) because SAC
+                              # is more sample-efficient
+    "max_steps":      1_000,  # max steps per episode
+                              # at 10ms/step → 10 seconds per episode
+
+    # ── Logging & checkpoints ──────────────────────────────────────────
+    "log_interval":    10,    # print progress every N episodes
+    "save_interval":   50,    # save checkpoint every N episodes
+    "checkpoint_dir": "checkpoints_sac",
+    "log_dir":        "logs_sac",
+
+    # ── Traffic patterns to train on ───────────────────────────────────
+    # Run one training job per pattern for the ablation study
+    "traffic_patterns": ["poisson", "bursty", "time_varying"],
+
+    # ── Reproducibility ────────────────────────────────────────────────
+    # Use multiple seeds for statistically rigorous results in the report
+    "seeds": [42, 123, 777],
+    "seed":  42,   # default seed for single runs
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -112,5 +213,67 @@ EXPERIMENT_CONFIGS = {
     "high_load": {
         **CONFIG,
         "arrival_rate": 50,          # 5× the default; queue saturates quickly
+    },
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# SAC Experiment presets
+# Mirror EXPERIMENT_CONFIGS above so SAC is tested under identical conditions
+# as PPO/DQN — required for a fair comparison in the report.
+#
+# Usage:
+#   from config import SAC_EXPERIMENT_CONFIGS
+#   config = SAC_EXPERIMENT_CONFIGS["high_load_bursty"]
+# ───────────────────────────────────────────────────────────────────────────
+
+SAC_EXPERIMENT_CONFIGS = {
+    # Standard training — matches PPO's default environment
+    "standard": {
+        **SAC_CONFIG,
+        "traffic_pattern": "poisson",
+        "arrival_rate":    10,
+    },
+
+    # Bursty traffic — where LSTM memory provides the biggest advantage.
+    # The agent must detect burst onsets and accumulate larger batches
+    # during peaks, then serve quickly when bursts end.
+    "bursty": {
+        **SAC_CONFIG,
+        "traffic_pattern": "bursty",
+        "arrival_rate":    10,
+    },
+
+    # Time-varying traffic — tests whether LSTM can learn peak/idle cycles.
+    # Peak hours (08:00–18:00) use peak_multiplier=2.5× arrival rate.
+    "time_varying": {
+        **SAC_CONFIG,
+        "traffic_pattern": "time_varying",
+        "arrival_rate":    10,
+    },
+
+    # High-load stress test — same as EXPERIMENT_CONFIGS["high_load"]
+    # but run through SAC to compare against PPO under identical pressure.
+    "high_load": {
+        **SAC_CONFIG,
+        "traffic_pattern": "poisson",
+        "arrival_rate":    50,
+    },
+
+    # Throughput-focused tuning: higher alpha_reward → agent prefers
+    # larger batches even at the cost of some extra latency.
+    "throughput_focused": {
+        **SAC_CONFIG,
+        "traffic_pattern": "bursty",
+        "alpha_reward":    2.0,   # 2× efficiency weight
+        "beta_reward":     0.005, # halved latency penalty
+    },
+
+    # Latency-focused tuning: higher beta_reward → agent aggressively
+    # avoids long waits, producing smaller but faster batches.
+    "latency_focused": {
+        **SAC_CONFIG,
+        "traffic_pattern": "bursty",
+        "alpha_reward":    0.5,   # halved efficiency weight
+        "beta_reward":     0.02,  # 2× latency penalty
     },
 }
