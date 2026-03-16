@@ -2,25 +2,49 @@
 # Central configuration for the Dynamic Request Batching RL project
 
 CONFIG = {
-    # Environment
-    "max_batch_size": 100,       # Maximum number of requests in a batch
-    "max_latency_ms": 500,       # SLA: oldest request must not exceed this (ms)
-    "arrival_rate": 10,          # Base Poisson arrival rate (requests/second)
-    "episode_ms": 60_000,        # Episode length in milliseconds (60 seconds)
-    "decision_interval_ms": 10,  # How often the agent makes a decision (ms)
+    # ── Environment ─────────────────────────────────────────────────────────
+    # Scaled to a realistic single GPU inference server node.
+    # At 2 000 req/s base rate with a 10 ms decision tick, ~20 requests
+    # arrive per tick on average (up to ~50 during peak hours).
+    # This creates real batching pressure — the agent cannot just flush every
+    # tick or it will pay the dispatch cost 100 times per second.
+    "max_batch_size": 500,       # Static fallback (or max bounds limit)
+    "dynamic_batching_enabled": True, # Enables capacity to scale with traffic
+    "min_batch_size": 10,        # Minimum functional batch limit
+    "max_possible_batch_size": 1000, # Absolute hardware capacity
+    "target_service_time_ms": 200, # Desired base accumulation window for scaling
+    "max_latency_ms": 500,       # SLA: oldest request must not exceed 500 ms
+    "arrival_rate": 2_000,       # Base Poisson rate (req/s) — realistic for one
+                                  # inference node serving a social media backend
+                                  # (Instagram: ~10k-100k QPS globally, ~2k per node)
+    "episode_ms": 60_000,        # 60 seconds of simulated time per episode
+    "decision_interval_ms": 10,  # Agent decides every 10 ms (100 Hz)
 
-    # Reward shaping
-    "alpha": 1.0,    # Reward multiplier for batch size (efficiency)
-    "beta": 0.01,    # Penalty multiplier for oldest_wait_ms (latency)
-    "gamma": 0.1,    # Penalty for idle (no requests, action=Wait)
+    # ── Reward shaping ───────────────────────────────────────────────────────
+    # alpha: reward per request served in a batch → encourages efficiency
+    # beta:  penalty per ms of oldest_wait → encourages low latency
+    # gamma: idle penalty when agent Waits with an empty queue
+    # serve_dispatch_cost: FIXED cost every time the agent hits Serve,
+    #   regardless of batch size. Represents GPU kernel launch overhead,
+    #   memory copy, network round-trip setup, etc.
+    #   This is the key parameter that makes the agent WANT to batch:
+    #     Serve(batch=1):  1.0 - latency - 3.0  ← likely negative (bad)
+    #     Serve(batch=5):  5.0 - latency - 3.0  ← break-even
+    #     Serve(batch=20): 20.0 - latency - 3.0 ← clearly positive (good)
+    "alpha": 1.0,
+    "beta":  0.002,              # Smaller beta now because wait_ms values will
+                                  # be larger at higher traffic — avoid dominating
+    "gamma": 0.5,                # Stronger idle penalty — empty queue should be rare
+    "serve_dispatch_cost": 3.0,  # Fixed overhead per Serve action.
+                                  # Forces agent to accumulate ~3+ requests before serving.
 
-    # SLA
-    "sla_penalty": -5.0,  # Penalty when oldest request exceeds max_latency_ms
+    # ── SLA ─────────────────────────────────────────────────────────────────
+    "sla_penalty": -50.0,        # Harsher SLA violation penalty at scale
 
-    # Traffic variation (time-of-day)
-    "peak_hours": (8, 18),       # 08:00–18:00 → peak traffic window
-    "peak_multiplier": 2.5,      # Lambda multiplier during peak hours
-    "offpeak_multiplier": 0.5,   # Lambda multiplier during off-peak hours
+    # ── Traffic variation (time-of-day) ──────────────────────────────────────
+    "peak_hours": (9, 23),       # Extended peak window (morning scroll → late night)
+    "peak_multiplier": 2.5,      # 5 000 req/s at peak — GPU near saturation
+    "offpeak_multiplier": 0.2,   # 400 req/s at night — agent learns patience
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -92,25 +116,38 @@ RPPO_CONFIG = {
 # ───────────────────────────────────────────────────────────────────────────
 
 EXPERIMENT_CONFIGS = {
-    # Low-traffic scenario: sparse arrivals, agent must decide whether to wait
-    # for a bigger batch or serve immediately to avoid idle-wait penalties.
-    # Expected behaviour: agent learns to accumulate more before serving.
-    "low_load": {
+    # ── Off-peak night traffic (e.g. 2 AM social media) ─────────────────────
+    # ~400 req/s — very sparse. ~4 requests arrive per 10 ms tick.
+    # Agent should accumulate longer to fill batches efficiently.
+    "off_peak": {
         **CONFIG,
-        "arrival_rate": 5,           # half the default traffic
+        "arrival_rate": 400,
+        "peak_multiplier": 1.5,
     },
 
-    # Standard scenario: matches CONFIG exactly — the default training regime.
-    "standard": {
+    # ── Standard daytime load ────────────────────────────────────────────────
+    # 2 000 req/s — default CONFIG. ~20 requests per tick.
+    # This is the primary training regime.
+    "standard": CONFIG,
+
+    # ── Peak hour stress test (e.g. Instagram at 7 PM) ───────────────────────
+    # 5 000 req/s — GPU is under pressure. ~50 requests per tick.
+    # Agent must balance batch efficiency vs SLA violations.
+    "peak_load": {
         **CONFIG,
-        "arrival_rate": 10,
+        "arrival_rate": 5_000,
+        "peak_multiplier": 3.0,       # up to 15 000 req/s burst
+        "sla_penalty": -100.0,        # harsher SLA at high load
     },
 
-    # High-traffic scenario: backpressure stress-test.  The queue fills fast;
-    # the agent must serve frequently to prevent SLA violations while still
-    # batching enough to get meaningful efficiency rewards.
-    "high_load": {
+    # ── Viral event / traffic spike (e.g. Super Bowl moment) ─────────────────
+    # 20 000 req/s — extreme backpressure test. Queue fills in milliseconds.
+    # Agent must serve aggressively to avoid SLA violations.
+    "viral_spike": {
         **CONFIG,
-        "arrival_rate": 50,          # 5× the default; queue saturates quickly
+        "arrival_rate": 20_000,
+        "max_batch_size": 1_000,      # GPU can handle larger batches
+        "peak_multiplier": 4.0,
+        "sla_penalty": -200.0,
     },
 }

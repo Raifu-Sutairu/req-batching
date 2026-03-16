@@ -74,7 +74,7 @@ class BatchingEnv(gym.Env):
         #  time_since_last_serve_ms, batch_fill_ratio, time_of_day]
         obs_low  = np.array([0,    0,    0,   0,   0.0, 0.0],  dtype=np.float32)
         obs_high = np.array([
-            self.cfg["max_batch_size"],          # pending_requests
+            self.cfg.get("max_possible_batch_size", self.cfg["max_batch_size"]), # pending_requests up to absolute max
             self.cfg["max_latency_ms"] * 2,      # oldest_wait_ms (allow overshoot)
             self.cfg["arrival_rate"] * self.cfg["peak_multiplier"] * 2,  # rate
             self.cfg["max_latency_ms"] * 2,      # time_since_last_serve_ms
@@ -152,7 +152,8 @@ class BatchingEnv(gym.Env):
         alpha = self.cfg["alpha"]
         beta  = self.cfg["beta"]
         gamma = self.cfg["gamma"]
-        sla_penalty = self.cfg["sla_penalty"]
+        sla_penalty        = self.cfg["sla_penalty"]
+        serve_dispatch_cost = self.cfg.get("serve_dispatch_cost", 0.0)
         max_lat = self.cfg["max_latency_ms"]
 
         # --- 1. Advance simulation clock & generate new arrivals ---------- #
@@ -164,9 +165,20 @@ class BatchingEnv(gym.Env):
             arrival_offset = self._rng.uniform(0, dt_ms)
             self._queue.append(self._sim_time_ms + arrival_offset)
 
-        # Cap queue at max_batch_size (oldest requests are kept)
-        if len(self._queue) > self.cfg["max_batch_size"]:
-            self._queue = self._queue[-self.cfg["max_batch_size"]:]
+        # --- Calculate Dynamic Batch Size Limit --------------------------- #
+        if self.cfg.get("dynamic_batching_enabled", False):
+            # Base accumulation = how many requests arrive in 'target_service_time_ms' on average
+            dynamic_target = int(self._ema_rate * (self.cfg["target_service_time_ms"] / 1000.0))
+            current_max_batch = max(
+                self.cfg["min_batch_size"], 
+                min(self.cfg["max_possible_batch_size"], dynamic_target)
+            )
+        else:
+            current_max_batch = self.cfg["max_batch_size"]
+
+        # Cap queue at current_max_batch (oldest requests are kept)
+        if len(self._queue) > current_max_batch:
+            self._queue = self._queue[-current_max_batch:]
 
         self._sim_time_ms += dt_ms
 
@@ -196,8 +208,11 @@ class BatchingEnv(gym.Env):
                 self._total_served += batch_size
                 self._total_batches += 1
 
-            # Reward: batch efficiency − latency penalty
-            reward = alpha * batch_size - beta * oldest_wait
+            # Reward: batch efficiency − latency penalty − fixed dispatch cost.
+            # The dispatch cost is the key term that prevents serving every tick:
+            # a batch of 1 earns  alpha×1 − dispatch_cost = likely negative.
+            # A batch of 20 earns alpha×20 − dispatch_cost = strongly positive.
+            reward = alpha * batch_size - beta * oldest_wait - serve_dispatch_cost
 
         else:  # Wait
             idle_penalty = 1.0 if len(self._queue) == 0 else 0.0
@@ -239,7 +254,16 @@ class BatchingEnv(gym.Env):
         oldest   = self._oldest_wait_ms()
         rate     = self._ema_rate
         t_since  = self._sim_time_ms - self._last_serve_ms
-        fill     = pending / self.cfg["max_batch_size"]
+        
+        if self.cfg.get("dynamic_batching_enabled", False):
+            current_max_batch = max(
+                self.cfg["min_batch_size"], 
+                min(self.cfg["max_possible_batch_size"], int(rate * (self.cfg["target_service_time_ms"] / 1000.0)))
+            )
+        else:
+            current_max_batch = self.cfg["max_batch_size"]
+            
+        fill     = pending / current_max_batch
         tod      = self._current_hour()
 
         obs = np.array([pending, oldest, rate, t_since, fill, tod], dtype=np.float32)
