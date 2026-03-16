@@ -10,6 +10,20 @@ Contains:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import init
+import numpy as np
+
+
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    """
+    Orthogonal initialization of linear layers.
+    Orthogonal init preserves the gradient scale and is highly
+    recommended for Policy Gradient methods.
+    """
+    init.orthogonal_(layer.weight, std)
+    if layer.bias is not None:
+        init.constant_(layer.bias, bias_const)
+    return layer
 
 
 class PolicyNetwork(nn.Module):
@@ -23,9 +37,11 @@ class PolicyNetwork(nn.Module):
     def __init__(self, state_dim: int, action_dim: int, hidden_sizes=(128, 64)):
         super(PolicyNetwork, self).__init__()
         
-        self.fc1 = nn.Linear(state_dim, hidden_sizes[0])
-        self.fc2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
-        self.fc3 = nn.Linear(hidden_sizes[1], action_dim)
+        self.fc1 = layer_init(nn.Linear(state_dim, hidden_sizes[0]))
+        self.fc2 = layer_init(nn.Linear(hidden_sizes[0], hidden_sizes[1]))
+        # Final policy layer gets a smaller weight init (0.01) to ensure
+        # that initial probabilities are uniform (max entropy/exploration)
+        self.fc3 = layer_init(nn.Linear(hidden_sizes[1], action_dim), std=0.01)
         
     def forward(self, x):
         """
@@ -53,9 +69,10 @@ class ValueNetwork(nn.Module):
     def __init__(self, state_dim: int, hidden_sizes=(128, 64)):
         super(ValueNetwork, self).__init__()
         
-        self.fc1 = nn.Linear(state_dim, hidden_sizes[0])
-        self.fc2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
-        self.fc3 = nn.Linear(hidden_sizes[1], 1)
+        self.fc1 = layer_init(nn.Linear(state_dim, hidden_sizes[0]))
+        self.fc2 = layer_init(nn.Linear(hidden_sizes[0], hidden_sizes[1]))
+        # Value layer gets a standard scale (1.0)
+        self.fc3 = layer_init(nn.Linear(hidden_sizes[1], 1), std=1.0)
         
     def forward(self, x):
         """
@@ -91,25 +108,25 @@ class ActorCriticNetwork(nn.Module):
         
         # Shared feature extraction trunk
         self.shared = nn.Sequential(
-            nn.Linear(state_dim, hidden_size),
+            layer_init(nn.Linear(state_dim, hidden_size)),
             nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
+            layer_init(nn.Linear(hidden_size, hidden_size)),
             nn.ReLU(),
         )
         
         # Actor head: outputs action probabilities
         self.actor_head = nn.Sequential(
-            nn.Linear(hidden_size, 64),
+            layer_init(nn.Linear(hidden_size, 64)),
             nn.ReLU(),
-            nn.Linear(64, action_dim),
+            layer_init(nn.Linear(64, action_dim), std=0.01),
             nn.Softmax(dim=-1),
         )
         
         # Critic head: outputs state-value estimate
         self.critic_head = nn.Sequential(
-            nn.Linear(hidden_size, 64),
+            layer_init(nn.Linear(hidden_size, 64)),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            layer_init(nn.Linear(64, 1), std=1.0),
         )
         
     def forward(self, x):

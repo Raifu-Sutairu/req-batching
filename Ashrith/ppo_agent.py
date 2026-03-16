@@ -104,6 +104,7 @@ class PPOAgent:
         entropy_coeff: float = 0.01,
         value_coeff: float = 0.5,
         max_grad_norm: float = 0.5,
+        target_kl: float = 0.015,
         n_epochs: int = 4,
         mini_batch_size: int = 64,
         rollout_length: int = 128,
@@ -149,6 +150,7 @@ class PPOAgent:
         self.entropy_coeff = entropy_coeff
         self.value_coeff = value_coeff
         self.max_grad_norm = max_grad_norm
+        self.target_kl = target_kl
         self.n_epochs = n_epochs
         self.mini_batch_size = mini_batch_size
         self.rollout_length = rollout_length
@@ -160,6 +162,7 @@ class PPOAgent:
         self.episodes_trained = 0
         self.steps_trained = 0
         self.updates_done = 0
+        self.early_stops = 0
         
     def select_action(self, state: np.ndarray, explore: bool = True) -> tuple:
         """
@@ -312,9 +315,14 @@ class PPOAgent:
         total_value_loss = 0
         total_entropy = 0
         total_clip_fraction = 0
+        approx_kl_total = 0
         num_updates = 0
+        continue_training = True
         
         for epoch in range(self.n_epochs):
+            if not continue_training:
+                break
+                
             for batch_indices in self.buffer.get_batches(self.mini_batch_size):
                 # Get mini-batch
                 mb_states = states[batch_indices]
@@ -332,6 +340,19 @@ class PPOAgent:
                 # ── Importance sampling ratio ──
                 # r(θ) = π_θ(a|s) / π_old(a|s)  = exp(log π_θ - log π_old)
                 ratio = torch.exp(new_log_probs - mb_old_log_probs)
+                
+                # ── Approximate KL Divergence ──
+                # http://joschu.net/blog/kl-approx.html
+                with torch.no_grad():
+                    # approx_kl = (ratio - 1) - log(ratio)
+                    log_ratio = new_log_probs - mb_old_log_probs
+                    approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean().item()
+                    
+                # Early stopping based on KL
+                if approx_kl > self.target_kl * 1.5:
+                    self.early_stops += 1
+                    continue_training = False
+                    break
                 
                 # ── Clipped surrogate objective ──
                 surr1 = ratio * mb_advantages
@@ -363,6 +384,7 @@ class PPOAgent:
                 total_value_loss += value_loss.item()
                 total_entropy += entropy.item()
                 total_clip_fraction += clip_fraction.item()
+                approx_kl_total += approx_kl
                 num_updates += 1
         
         self.steps_trained += len(self.buffer)
@@ -375,7 +397,8 @@ class PPOAgent:
             'policy_loss': total_policy_loss / max(num_updates, 1),
             'value_loss': total_value_loss / max(num_updates, 1),
             'entropy': total_entropy / max(num_updates, 1),
-            'clip_fraction': total_clip_fraction / max(num_updates, 1)
+            'clip_fraction': total_clip_fraction / max(num_updates, 1),
+            'approx_kl': approx_kl_total / max(num_updates, 1)
         }
     
     def end_episode(self):
@@ -384,12 +407,14 @@ class PPOAgent:
     
     def save(self, filepath: str):
         """Save agent state."""
+        # Also save early_stops in the dictionary
         torch.save({
             'network': self.network.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'episodes_trained': self.episodes_trained,
             'steps_trained': self.steps_trained,
-            'updates_done': self.updates_done
+            'updates_done': self.updates_done,
+            'early_stops': self.early_stops
         }, filepath)
     
     def load(self, filepath: str):
@@ -397,6 +422,7 @@ class PPOAgent:
         checkpoint = torch.load(filepath, map_location=self.device)
         self.network.load_state_dict(checkpoint['network'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.episodes_trained = checkpoint['episodes_trained']
-        self.steps_trained = checkpoint['steps_trained']
-        self.updates_done = checkpoint['updates_done']
+        self.episodes_trained = checkpoint.get('episodes_trained', 0)
+        self.steps_trained = checkpoint.get('steps_trained', 0)
+        self.updates_done = checkpoint.get('updates_done', 0)
+        self.early_stops = checkpoint.get('early_stops', 0)

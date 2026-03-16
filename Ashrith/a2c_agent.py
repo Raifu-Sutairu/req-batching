@@ -163,11 +163,13 @@ class A2CAgent:
                 _, next_value = self.network(next_tensor)
                 R = next_value.squeeze()
         
-        # ── Step 2: Compute N-step returns (backward) ──
+        # ── Step 2: Compute N-step returns (backward, O(1) appends) ──
         returns = []
         for r in reversed(self.rewards):
             R = r + self.gamma * R
-            returns.insert(0, R)
+            returns.append(R)
+        
+        returns.reverse()  # Restore correct order
         
         returns = torch.stack(returns).to(self.device)
         log_probs = torch.stack(self.log_probs)
@@ -177,6 +179,10 @@ class A2CAgent:
         # ── Step 3: Compute advantages ──
         # A(s,a) = R_t (N-step return) - V(s_t)
         advantages = returns - values.detach()
+        
+        # Normalize advantages (crucial for PPO/A2C stability)
+        if len(advantages) > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         # ── Step 4: Compute losses ──
         # Policy loss: -log π(a|s) * A(s,a)
