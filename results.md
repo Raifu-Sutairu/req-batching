@@ -1,10 +1,10 @@
-# 📊 Results & Policy Analysis: The Power of IMPALA V3
+#  Results & Policy Analysis: The Power of IMPALA V3
 
 This document breaks down how our AI "brain" performed and explains the technical wizardry behind **IMPALA V3** in a way that doesn't require a Ph.D. in Mathematics.
 
 ---
 
-## 🔬 The Policy: How the "Brain" Works
+##  The Policy: How the "Brain" Works
 
 ### 1. The Memory Core (Temporal Learning)
 Unlike simple AIs that only look at the *current* second, our policy uses something called an **LSTM (Long Short-Term Memory)**. 
