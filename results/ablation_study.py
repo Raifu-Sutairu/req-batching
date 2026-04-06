@@ -20,8 +20,10 @@ Usage:
     python results/ablation_study.py
 
 Outputs:
-    results/ablation.png              — bar chart of reward drop per feature
-    Terminal                          — formatted table
+    results/ablation_vertical.png   — vertical bar chart (reward drop)
+    results/ablation_horizontal.png — horizontal bar chart sorted by importance
+    results/ablation_dashboard.png  — both charts side by side
+    Terminal                        — formatted table
 """
 
 import os
@@ -36,22 +38,20 @@ import gymnasium as gym
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.monitor import Monitor
 
 from env.batching_env import BatchingEnv
 from config import CONFIG
 
 # ── Hyperparameters for the ablation runs ────────────────────────────────────
-# We trade off accuracy for speed: 200k steps × 2 seeds = manageable runtime.
 ABLATION_TIMESTEPS = 200_000
 N_SEEDS            = 2
 N_EVAL_EPISODES    = 10
 N_ENVS             = 4
 
 RESULTS_DIR = os.path.join(ROOT, "results")
-PLOT_PATH   = os.path.join(RESULTS_DIR, "ablation.png")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # ── Observation feature names (must match BatchingEnv._get_obs() order) ──────
@@ -64,14 +64,41 @@ FEATURE_NAMES = [
     "time_of_day",
 ]
 
-# ── Dark-theme colours ────────────────────────────────────────────────────────
+FEATURE_LABELS = [
+    "Pending\nRequests",
+    "Oldest\nWait (ms)",
+    "Request\nRate",
+    "Since Last\nServe (ms)",
+    "Fill\nRatio",
+    "Time of\nDay",
+]
+
+# ── Dark-theme design tokens ──────────────────────────────────────────────────
 BG_FIG    = "#0a0e1a"
 BG_AX     = "#141c30"
 COL_GRID  = "#2a3450"
 COL_SPINE = "#2a3450"
 COL_TEXT  = "#e8eaf6"
-COL_BASE  = "#00e5ff"    # cyan — full model bar
-COL_DROP  = "#ef5350"    # red  — ablated bars
+COL_MUTED = "#7986cb"
+
+# Gradient palette: most important → least important
+# These are assigned after sorting, so colour = rank, not feature index
+RANK_COLORS = [
+    "#00e5ff",   # rank 1 — cyan (most important)
+    "#40c4ff",   # rank 2
+    "#7c4dff",   # rank 3
+    "#e040fb",   # rank 4
+    "#ff6f00",   # rank 5
+    "#f44336",   # rank 6 — red (least important)
+]
+
+plt.rcParams.update({
+    "font.family":      "DejaVu Sans",
+    "text.color":       COL_TEXT,
+    "axes.labelcolor":  COL_TEXT,
+    "xtick.color":      COL_TEXT,
+    "ytick.color":      COL_TEXT,
+})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -84,13 +111,6 @@ class ZeroFeatureWrapper(gym.ObservationWrapper):
     By zeroing a feature at the *environment* level (not the model level),
     we ensure the agent can never recover the information through correlated
     features — the ablation is clean.
-
-    Parameters
-    ----------
-    env : gym.Env
-        The wrapped environment.
-    feature_idx : int
-        Index of the observation dimension to zero out.
     """
 
     def __init__(self, env: gym.Env, feature_idx: int):
@@ -119,32 +139,17 @@ def _make_env_factory(feature_idx: int | None, seed: int):
 
 
 def train_one(feature_idx: int | None, seed: int) -> float:
-    """Train a PPO agent (possibly ablated) and return its mean eval reward.
-
-    Parameters
-    ----------
-    feature_idx : int | None
-        Feature to zero out.  None = full model (baseline).
-    seed : int
-        Random seed for reproducibility.
-
-    Returns
-    -------
-    float
-        Mean episode reward over N_EVAL_EPISODES deterministic rollouts.
-    """
-    from stable_baselines3.common.env_util import make_vec_env
-
-    # Vectorised training env
-    env_fns = [_make_env_factory(feature_idx, seed + i) for i in range(N_ENVS)]
+    """Train a PPO agent (possibly ablated) and return its mean eval reward."""
     from stable_baselines3.common.vec_env import DummyVecEnv
+
+    env_fns  = [_make_env_factory(feature_idx, seed + i) for i in range(N_ENVS)]
     train_env = DummyVecEnv(env_fns)
 
     model = PPO(
         "MlpPolicy",
         train_env,
         learning_rate=3e-4,
-        n_steps=1024,       # shorter for speed
+        n_steps=1024,
         batch_size=64,
         n_epochs=5,
         gamma=0.99,
@@ -159,14 +164,14 @@ def train_one(feature_idx: int | None, seed: int) -> float:
     train_env.close()
 
     # Deterministic evaluation
-    rewards = []
+    rewards  = []
     eval_env = BatchingEnv(seed=seed + 9999)
     if feature_idx is not None:
         eval_env = ZeroFeatureWrapper(eval_env, feature_idx)
 
     for ep in range(N_EVAL_EPISODES):
         obs, _ = eval_env.reset(seed=seed + 9999 + ep)
-        total = 0.0
+        total  = 0.0
         terminated = truncated = False
         while not (terminated or truncated):
             action, _ = model.predict(obs, deterministic=True)
@@ -216,72 +221,164 @@ def run_ablation() -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plotting
+# Helpers shared by both plots
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_ablation(results: dict) -> str:
-    """Generate bar chart of reward drop and save to results/ablation.png."""
-    full_r  = results["_full_"]
-    names   = FEATURE_NAMES
-    drops   = [full_r - results[n] for n in names]
-
-    plt.rcParams.update({
-        "font.family": "DejaVu Sans",
-        "text.color":  COL_TEXT,
-    })
-
-    fig, ax = plt.subplots(figsize=(10, 6), facecolor=BG_FIG)
-    fig.subplots_adjust(left=0.14, right=0.96, top=0.88, bottom=0.14)
-
-    x     = np.arange(len(names))
-    bars  = ax.bar(x, drops, color=COL_DROP, width=0.55, alpha=0.88, zorder=3)
-
-    # Highlight the most important feature
-    max_idx = int(np.argmax(drops))
-    bars[max_idx].set_color(COL_BASE)
-    bars[max_idx].set_alpha(1.0)
-
-    # Value labels
-    for bar, drop in zip(bars, drops):
-        ax.annotate(
-            f"Δ{drop:+.0f}",
-            xy=(bar.get_x() + bar.get_width() / 2, max(drop, 0)),
-            xytext=(0, 4), textcoords="offset points",
-            ha="center", va="bottom",
-            color=COL_TEXT, fontsize=8.5, fontweight="bold",
-        )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(names, rotation=22, ha="right", color=COL_TEXT, fontsize=9)
-    ax.set_ylabel("Reward Drop  (Full − Ablated)", labelpad=8)
-    ax.yaxis.label.set_color(COL_TEXT)
-    ax.xaxis.label.set_color(COL_TEXT)
-    ax.set_title(
-        f"Feature Importance via Ablation\n"
-        f"Full model reward: {full_r:+.0f}   |   "
-        f"higher bar = more important feature",
-        color=COL_TEXT, fontsize=11, fontweight="bold", pad=10,
-    )
-
+def _style(ax, title="", xlabel="", ylabel="", grid_axis="y"):
     ax.set_facecolor(BG_AX)
     for sp in ax.spines.values():
         sp.set_edgecolor(COL_SPINE)
-    ax.tick_params(colors=COL_TEXT)
-    ax.grid(True, axis="y", color=COL_GRID, linewidth=0.5, alpha=0.8)
-    ax.axhline(0, color=COL_TEXT, linewidth=0.7, linestyle="--", alpha=0.4)
+    ax.tick_params(colors=COL_TEXT, labelsize=9)
+    ax.xaxis.label.set_color(COL_TEXT)
+    ax.yaxis.label.set_color(COL_TEXT)
+    ax.grid(True, axis=grid_axis, color=COL_GRID, linewidth=0.5, alpha=0.7, zorder=0)
+    if title:
+        ax.set_title(title, color=COL_TEXT, fontsize=11, fontweight="bold", pad=10)
+    if xlabel:
+        ax.set_xlabel(xlabel, labelpad=6)
+    if ylabel:
+        ax.set_ylabel(ylabel, labelpad=6)
 
-    # Legend
-    from matplotlib.patches import Patch
+
+def _rank_colors(drops):
+    """Assign gradient colours by rank (highest drop = rank 0 = most important)."""
+    order = np.argsort(drops)[::-1]   # descending: most important first
+    colours = [""] * len(drops)
+    for rank, idx in enumerate(order):
+        colours[idx] = RANK_COLORS[rank]
+    return colours
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot A — Vertical bar chart (original layout, enhanced)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_vertical(results: dict, ax=None) -> str | None:
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(10, 6), facecolor=BG_FIG)
+        fig.subplots_adjust(left=0.13, right=0.97, top=0.88, bottom=0.18)
+
+    full_r = results["_full_"]
+    drops  = [full_r - results[n] for n in FEATURE_NAMES]
+    colors = _rank_colors(drops)
+    x      = np.arange(len(FEATURE_NAMES))
+
+    bars = ax.bar(x, drops, color=colors, width=0.58, alpha=0.90, zorder=3)
+
+    for bar, drop, col in zip(bars, drops, colors):
+        pct = 100.0 * drop / abs(full_r) if full_r != 0 else 0
+        label = f"Δ{drop:+.0f}\n({pct:+.0f}%)"
+        ax.annotate(
+            label,
+            xy=(bar.get_x() + bar.get_width() / 2, max(drop, 0)),
+            xytext=(0, 4), textcoords="offset points",
+            ha="center", va="bottom",
+            color=COL_TEXT, fontsize=8, fontweight="bold",
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(FEATURE_LABELS, color=COL_TEXT, fontsize=8.5)
+    ax.axhline(0, color=COL_TEXT, linewidth=0.7, linestyle="--", alpha=0.4)
+    _style(ax,
+           title=(f"Feature Importance via Ablation\n"
+                  f"Full model reward: {full_r:+.0f}  |  higher bar = more important"),
+           ylabel="Reward Drop  (Full − Ablated)")
+
+    # Legend: rank 1 = most important
     legend_elems = [
-        Patch(facecolor=COL_BASE, label=f"Most important: {names[max_idx]}"),
-        Patch(facecolor=COL_DROP, label="Other features"),
+        mpatches.Patch(facecolor=RANK_COLORS[0], label="Most important"),
+        mpatches.Patch(facecolor=RANK_COLORS[-1], label="Least important"),
     ]
     ax.legend(handles=legend_elems, facecolor=BG_AX, edgecolor=COL_SPINE,
-              labelcolor=COL_TEXT, fontsize=8)
+              labelcolor=COL_TEXT, fontsize=8.5)
 
-    fig.savefig(PLOT_PATH, dpi=150, bbox_inches="tight", facecolor=BG_FIG)
+    if standalone:
+        path = os.path.join(RESULTS_DIR, "ablation_vertical.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=BG_FIG)
+        plt.close(fig)
+        return path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plot B — Horizontal bar chart sorted by importance (easier to rank visually)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_horizontal(results: dict, ax=None) -> str | None:
+    standalone = ax is None
+    if standalone:
+        fig, ax = plt.subplots(figsize=(9, 6), facecolor=BG_FIG)
+        fig.subplots_adjust(left=0.22, right=0.97, top=0.88, bottom=0.12)
+
+    full_r = results["_full_"]
+    drops  = np.array([full_r - results[n] for n in FEATURE_NAMES])
+
+    # Sort descending (most important at top)
+    order  = np.argsort(drops)[::-1]
+    sorted_labels = [FEATURE_LABELS[i] for i in order]
+    sorted_drops  = drops[order]
+    sorted_colors = RANK_COLORS[:len(drops)]   # already ranked best→worst
+
+    y = np.arange(len(sorted_drops))
+
+    bars = ax.barh(y, sorted_drops, color=sorted_colors, height=0.60,
+                   alpha=0.90, zorder=3)
+
+    for bar, drop in zip(bars, sorted_drops):
+        pct = 100.0 * drop / abs(full_r) if full_r != 0 else 0
+        ax.annotate(
+            f"  Δ{drop:+.0f}  ({pct:+.0f}%)",
+            xy=(max(drop, 0), bar.get_y() + bar.get_height() / 2),
+            xytext=(3, 0), textcoords="offset points",
+            ha="left", va="center",
+            color=COL_TEXT, fontsize=8.5, fontweight="bold",
+        )
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(sorted_labels, color=COL_TEXT, fontsize=9)
+    ax.invert_yaxis()   # most important at top
+    ax.axvline(0, color=COL_TEXT, linewidth=0.7, linestyle="--", alpha=0.4)
+    _style(ax,
+           title="Feature Importance Ranking  (sorted)",
+           xlabel="Reward Drop  (Full − Ablated)",
+           grid_axis="x")
+
+    # Rank badges
+    for rank, (bar, lbl) in enumerate(zip(bars, sorted_labels)):
+        ax.text(
+            -0.03, bar.get_y() + bar.get_height() / 2,
+            f"#{rank+1}",
+            transform=ax.get_yaxis_transform(),
+            ha="right", va="center",
+            color=sorted_colors[rank], fontsize=8.5, fontweight="bold",
+        )
+
+    if standalone:
+        path = os.path.join(RESULTS_DIR, "ablation_horizontal.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=BG_FIG)
+        plt.close(fig)
+        return path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard: side-by-side
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_dashboard(results: dict) -> str:
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7), facecolor=BG_FIG)
+    fig.subplots_adjust(left=0.07, right=0.97, top=0.90, bottom=0.14, wspace=0.32)
+    fig.suptitle(
+        "Dynamic Request Batching — Feature Ablation Study",
+        color=COL_TEXT, fontsize=14, fontweight="bold", y=0.97,
+    )
+
+    plot_vertical(results, ax=axes[0])
+    plot_horizontal(results, ax=axes[1])
+
+    path = os.path.join(RESULTS_DIR, "ablation_dashboard.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=BG_FIG)
     plt.close(fig)
-    return PLOT_PATH
+    return path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,18 +386,22 @@ def plot_ablation(results: dict) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def print_table(results: dict):
-    full_r = results["_full_"]
-    W = 60
+    full_r  = results["_full_"]
+    drops   = [full_r - results[n] for n in FEATURE_NAMES]
+    order   = sorted(range(len(FEATURE_NAMES)), key=lambda i: drops[i], reverse=True)
+
+    W = 66
     print("\n" + "=" * W)
-    print(f"{'Feature':<22}  {'Ablated Reward':>14}  {'Δ Reward':>10}")
+    print(f"  {'Rank':<5}  {'Feature':<22}  {'Ablated Reward':>14}  {'Δ Reward':>10}")
     print("-" * W)
-    for name in FEATURE_NAMES:
-        r    = results[name]
-        drop = full_r - r
-        bar  = "█" * max(0, int(drop / max(max(results[n] for n in FEATURE_NAMES), 1) * 20))
-        print(f"  {name:<20}  {r:>+14.1f}  {drop:>+10.1f}  {bar}")
-    print("=" * W)
-    print(f"  Full model (baseline)    {full_r:>+14.1f}")
+    for rank, idx in enumerate(order):
+        name  = FEATURE_NAMES[idx]
+        r     = results[name]
+        drop  = drops[idx]
+        bar   = "█" * max(0, int(drop / max(max(drops), 1) * 18))
+        print(f"  #{rank+1:<4}  {name:<22}  {r:>+14.1f}  {drop:>+10.1f}  {bar}")
+    print("-" * W)
+    print(f"  {'Full model (baseline)':<28}  {full_r:>+14.1f}")
     print("=" * W)
 
 
@@ -309,16 +410,17 @@ def print_table(results: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    print("=" * 60)
+    SEP = "=" * 60
+    print(SEP)
     print("  Dynamic Request Batching — Ablation Study")
-    print("=" * 60)
+    print(SEP)
     print(f"  Features      : {len(FEATURE_NAMES)}")
     print(f"  Seeds/feature : {N_SEEDS}")
     print(f"  Timesteps     : {ABLATION_TIMESTEPS:,}")
     print(f"  Total runs    : {(len(FEATURE_NAMES) + 1) * N_SEEDS}")
     t_est = (len(FEATURE_NAMES) + 1) * N_SEEDS * (ABLATION_TIMESTEPS / 1200) / 60
     print(f"  Est. runtime  : ~{t_est:.0f} min on CPU")
-    print("=" * 60)
+    print(SEP)
 
     t0 = time.time()
     results = run_ablation()
@@ -326,9 +428,27 @@ def main():
 
     print_table(results)
 
-    path = plot_ablation(results)
-    print(f"\n✓  Ablation chart saved → {path}")
-    print(f"✓  Total elapsed: {elapsed/60:.1f} min")
+    v_path = os.path.join(RESULTS_DIR, "ablation_vertical.png")
+    h_path = os.path.join(RESULTS_DIR, "ablation_horizontal.png")
+
+    fig_v, ax_v = plt.subplots(figsize=(10, 6), facecolor=BG_FIG)
+    fig_v.subplots_adjust(left=0.13, right=0.97, top=0.88, bottom=0.18)
+    plot_vertical(results, ax=ax_v)
+    fig_v.savefig(v_path, dpi=150, bbox_inches="tight", facecolor=BG_FIG)
+    plt.close(fig_v)
+
+    fig_h, ax_h = plt.subplots(figsize=(9, 6), facecolor=BG_FIG)
+    fig_h.subplots_adjust(left=0.22, right=0.97, top=0.88, bottom=0.12)
+    plot_horizontal(results, ax=ax_h)
+    fig_h.savefig(h_path, dpi=150, bbox_inches="tight", facecolor=BG_FIG)
+    plt.close(fig_h)
+
+    d_path = plot_dashboard(results)
+
+    print(f"\n✓  Vertical chart    → {v_path}")
+    print(f"✓  Horizontal chart  → {h_path}")
+    print(f"✓  Dashboard         → {d_path}")
+    print(f"✓  Total elapsed     : {elapsed/60:.1f} min")
 
 
 if __name__ == "__main__":

@@ -33,7 +33,8 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.patches as mpatches
 from matplotlib.ticker import MaxNLocator
-from stable_baselines3 import PPO
+from stable_baselines3 import PPO, DQN
+from sb3_contrib import RecurrentPPO
 
 from env.batching_env import BatchingEnv
 from config import CONFIG
@@ -71,6 +72,9 @@ class LiveState:
     def __init__(self, model, env):
         self.model = model
         self.env   = env
+        self.is_recurrent = False
+        self.lstm_states = None
+        self.episode_started = True
 
         # Rolling histories
         self.q_hist      = collections.deque(maxlen=HISTORY)  # queue size
@@ -102,9 +106,20 @@ class LiveState:
         self.obs, _ = self.env.reset()
         self.ep_reward  = 0.0
         self.ep_count  += 1
+        self.lstm_states = None
+        self.episode_started = True
 
     def step(self):
-        action, _ = self.model.predict(self.obs, deterministic=True)
+        if self.is_recurrent:
+            import numpy as np
+            ep_start = np.array([self.episode_started], dtype=bool)
+            action, self.lstm_states = self.model.predict(
+                self.obs, state=self.lstm_states, episode_start=ep_start, deterministic=True
+            )
+            self.episode_started = False
+        else:
+            action, _ = self.model.predict(self.obs, deterministic=True)
+            
         obs, reward, terminated, truncated, info = self.env.step(int(action))
 
         self.obs         = obs
@@ -151,8 +166,24 @@ def _style_ax(ax, title: str = "", xlabel: str = "", ylabel: str = ""):
 def build_demo(model_path: str, interval_ms: int = 50):
     # ── Load model + env ──────────────────────────────────────────────────────
     env   = BatchingEnv()
-    model = PPO.load(model_path, env=env)
+    
+    custom_objects = {
+        "observation_space": env.observation_space,
+        "action_space": env.action_space
+    }
+    
+    if "rppo" in model_path.lower():
+        model = RecurrentPPO.load(model_path, env=env, custom_objects=custom_objects)
+        is_recurrent = True
+    elif "dqn" in model_path.lower():
+        model = DQN.load(model_path, env=env, custom_objects=custom_objects)
+        is_recurrent = False
+    else:
+        model = PPO.load(model_path, env=env, custom_objects=custom_objects)
+        is_recurrent = False
+        
     state = LiveState(model, env)
+    state.is_recurrent = is_recurrent
 
     # ── Figure skeleton ────────────────────────────────────────────────────────
     plt.rcParams.update({

@@ -9,6 +9,7 @@ Steps:
   3. Train PPO agent (500k timesteps)
   4. Generate comparison plots (PPO vs all baselines, 30 episodes each)
   5. Launch live demo (real-time animation)
+  6. Generate comprehensive comparison graph suite (8 charts + dashboard)
 
 Each step is wrapped in a try/except so a failure doesn't stop the pipeline.
 Run from project root:
@@ -181,6 +182,29 @@ def step5_demo():
         _err(exc)
 
 
+# ────────────────────────────────────────────────────────────────
+# Step 6 — Comprehensive comparison graph suite
+# ────────────────────────────────────────────────────────────────
+
+def step6_comparison_graphs():
+    _header(6, "Generating comprehensive comparison graph suite...")
+    try:
+        from results.comparison_graphs import run_evaluation, save_all_individual, build_dashboard, print_summary, GRAPHS_DIR
+
+        print("  Evaluating all agents (30 episodes each)...")
+        data = run_evaluation(n_episodes=30)
+        print_summary(data)
+
+        print("\n  Saving individual charts...")
+        save_all_individual(data)
+
+        dash = build_dashboard(data)
+        _ok(f"Dashboard saved → {dash}")
+        print(f"  All graphs in: {GRAPHS_DIR}")
+    except Exception as exc:
+        _err(exc)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +221,7 @@ def main():
     step3_train()
     step4_evaluate()
     step5_demo()
+    step6_comparison_graphs()
 
     elapsed = time.time() - t_start
     print(f"\n{SEP}")

@@ -152,45 +152,61 @@ def collect_episode_data(agent, env, n_episodes: int, seed_offset: int) -> dict:
     Returns
     -------
     dict with keys:
-        rewards      : list[float]      — total reward per episode
-        batch_sizes  : list[int]        — batch size at every Serve action
-        latencies    : list[float]      — per-request latency at every Serve
+        rewards        : list[float]  — total reward per episode
+        batch_sizes    : list[int]    — batch size at every Serve action
+        latencies      : list[float]  — per-request latency at every Serve
+        throughputs    : list[int]    — total requests served per episode
+        sla_violations : list[int]    — Serve actions that occurred after SLA breach
+        n_serve_actions: list[int]    — total Serve actions per episode
     """
-    rewards     = []
-    batch_sizes = []
-    latencies   = []
+    sla_ms      = CONFIG["max_latency_ms"]
+    rewards         = []
+    batch_sizes     = []
+    latencies       = []
+    throughputs     = []
+    sla_violations  = []
+    n_serve_actions = []
 
     for ep in range(n_episodes):
         obs, info = env.reset(seed=seed_offset + ep)
-        total_reward = 0.0
+        total_reward  = 0.0
         terminated = truncated = False
-        prev_served = 0
+        prev_served   = 0
+        ep_sla_viols  = 0
+        ep_serve_acts = 0
 
         if hasattr(agent, "reset"):
             agent.reset()
 
-        # track queue snapshot before each serve
         while not (terminated or truncated):
             action = agent.predict(obs)
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
 
-            # Infer batch_size from total_served delta
             if action == 1:
+                ep_serve_acts += 1
                 served_now = info["total_served"] - prev_served
                 if served_now > 0:
                     batch_sizes.append(served_now)
-                    # mean_latency_ms from info is cumulative; use as proxy
                     if info["mean_latency_ms"] > 0:
                         latencies.append(info["mean_latency_ms"])
+                    # SLA: oldest_wait_ms is obs[1] after the step
+                    if float(obs[1]) > sla_ms:
+                        ep_sla_viols += 1
                 prev_served = info["total_served"]
 
         rewards.append(total_reward)
+        throughputs.append(info["total_served"])
+        sla_violations.append(ep_sla_viols)
+        n_serve_actions.append(ep_serve_acts)
 
     return {
-        "rewards": rewards,
-        "batch_sizes": batch_sizes,
-        "latencies": latencies,
+        "rewards":         rewards,
+        "batch_sizes":     batch_sizes,
+        "latencies":       latencies,
+        "throughputs":     throughputs,
+        "sla_violations":  sla_violations,
+        "n_serve_actions": n_serve_actions,
     }
 
 
@@ -373,8 +389,38 @@ def plot_latency_cdf(ax, data: dict[str, dict]):
     _apply_dark_style(ax)
 
 
+def plot_throughput_bars(ax, data: dict[str, dict]):
+    """Panel 4: Bar chart of mean throughput (requests served per episode)."""
+    means  = [np.mean(data[n].get("throughputs", [0])) for n in AGENT_ORDER]
+    stds   = [np.std(data[n].get("throughputs", [0]))  for n in AGENT_ORDER]
+    colors = [AGENT_COLORS[n]                           for n in AGENT_ORDER]
+    x      = np.arange(len(AGENT_ORDER))
+
+    bars = ax.bar(x, means, yerr=stds, color=colors, width=0.55,
+                  capsize=6, error_kw=dict(color=TEXT_COLOR, linewidth=1.5),
+                  alpha=0.88, zorder=3)
+
+    for bar, mean in zip(bars, means):
+        ax.annotate(
+            f"{mean:,.0f}",
+            xy=(bar.get_x() + bar.get_width() / 2, mean),
+            xytext=(0, 5), textcoords="offset points",
+            ha="center", va="bottom",
+            color=TEXT_COLOR, fontsize=8.5, fontweight="bold",
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(AGENT_ORDER, color=TEXT_COLOR)
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:,.0f}"))
+    ax.set_title("Throughput — Requests Served / Episode", fontweight="bold", fontsize=11)
+    ax.set_ylabel("Requests Served", labelpad=8)
+    ax.text(0.98, 0.96, "↑ higher is better", transform=ax.transAxes,
+            ha="right", va="top", color="#7986cb", fontsize=8, fontstyle="italic")
+    _apply_dark_style(ax)
+
+
 def generate_figure(data: dict[str, dict]) -> str:
-    """Build the 3-panel figure, save it, and return the path."""
+    """Build a 2×2 four-panel figure, save it, and return the path."""
     plt.rcParams.update({
         "font.family":       "DejaVu Sans",
         "text.color":        TEXT_COLOR,
@@ -384,23 +430,40 @@ def generate_figure(data: dict[str, dict]) -> str:
     })
 
     fig, axes = plt.subplots(
-        1, 3,
-        figsize=(18, 6),
+        2, 2,
+        figsize=(18, 12),
         facecolor=BG_FIGURE,
     )
-    fig.subplots_adjust(left=0.06, right=0.97, top=0.88, bottom=0.14, wspace=0.30)
+    fig.subplots_adjust(left=0.07, right=0.97, top=0.93, bottom=0.08,
+                        wspace=0.28, hspace=0.38)
 
     fig.suptitle(
         "Dynamic Request Batching — Agent Comparison",
         color=TEXT_COLOR,
-        fontsize=14,
+        fontsize=15,
         fontweight="bold",
-        y=0.98,
+        y=0.97,
     )
 
-    plot_reward_bars(axes[0], data)
-    plot_batch_histogram(axes[1], data)
-    plot_latency_cdf(axes[2], data)
+    plot_reward_bars(axes[0, 0], data)
+    plot_batch_histogram(axes[0, 1], data)
+    plot_latency_cdf(axes[1, 0], data)
+    plot_throughput_bars(axes[1, 1], data)
+
+    # Shared legend
+    from matplotlib.patches import Patch
+    legend_elems = [
+        Patch(facecolor=AGENT_COLORS[n], label=n) for n in AGENT_ORDER
+    ]
+    fig.legend(
+        handles=legend_elems,
+        loc="lower center",
+        ncol=len(AGENT_ORDER),
+        facecolor=BG_AXES, edgecolor=GRID_COLOR,
+        labelcolor=TEXT_COLOR, fontsize=9,
+        bbox_to_anchor=(0.5, 0.01),
+        framealpha=0.85,
+    )
 
     fig.savefig(PLOT_PATH, dpi=150, bbox_inches="tight", facecolor=BG_FIGURE)
     plt.close(fig)
