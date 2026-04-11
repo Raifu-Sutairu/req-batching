@@ -1,16 +1,16 @@
 # Dynamic Request Batching — Reinforcement Learning Agent
 
-A university course project implementing a **Proximal Policy Optimization (PPO)** agent that learns *when* to serve accumulated cache requests. The agent observes six state signals and chooses every 10 ms whether to dispatch the current queue as a batch or wait for more requests to arrive — balancing throughput efficiency against client latency.
+A project implementing a **Soft Actor-Critic (SAC)** agent enhanced with **LSTM** (for temporal sequence modeling) and **Prioritized Experience Replay (PER)**. The agent learns *when* to serve accumulated cache requests. The agent observes various state signals and chooses every 10 ms whether to dispatch the current queue as a batch or wait for more requests to arrive — balancing throughput efficiency against client latency.
 
 ---
 
 ## Installation
 
 ```bash
-pip install "stable-baselines3[extra]" gymnasium scipy matplotlib numpy
+pip install gymnasium scipy matplotlib numpy torch
 ```
 
-> **Python ≥ 3.12** is required (uses union-type hints). All packages are CPU-friendly; no GPU needed.
+> **Python ≥ 3.12** is recommended.
 
 ---
 
@@ -20,33 +20,7 @@ pip install "stable-baselines3[extra]" gymnasium scipy matplotlib numpy
 ```bash
 python3 run_all.py
 ```
-This runs all five steps in order (validate → baseline eval → train → compare → demo), catching and printing any errors without crashing.
-
-### Just the live demo (after training)
-```bash
-python3 demo/live_demo.py
-
-# Optional flags
-python3 demo/live_demo.py --speed 3.0          # faster animation
-python3 demo/live_demo.py --model models/ppo_batching_final
-```
-
-### Train only
-```bash
-python3 agent/train.py
-tensorboard --logdir tensorboard_logs/         # real-time curves
-```
-
-### Evaluate & generate plots
-```bash
-python3 agent/evaluate.py                      # comparison plots + heatmap
-python3 agent/evaluate.py --skip-heatmap       # faster, skip heatmap
-```
-
-### Ablation study (feature importance)
-```bash
-python3 results/ablation_study.py              # ~15–20 min on CPU
-```
+This script orchestrates the environment validation, trains the SAC+LSTM+PER agent across different traffic patterns, and evaluates the agent against internal heuristic baselines.
 
 ---
 
@@ -54,97 +28,56 @@ python3 results/ablation_study.py              # ~15–20 min on CPU
 
 The batching problem is cast as a **Markov Decision Process**:
 
-### State (6-dimensional continuous)
+### State (8-dimensional continuous)
 
-| Index | Feature | Why it matters |
-|---|---|---|
-| 0 | `pending_requests` | Direct measure of batch size we'd get if we served now |
-| 1 | `oldest_wait_ms` | Age of the head-of-queue request; drives SLA risk |
-| 2 | `request_rate` | EMA of arrival rate; predicts how fast queue will grow |
-| 3 | `since_serve_ms` | Time since last dispatch; context for idle penalties |
-| 4 | `batch_fill_ratio` | `pending / max_batch_size`; normalised queue fullness |
-| 5 | `time_of_day` | Fractional hour (0–24); correlates with traffic load |
+| Index | Feature |
+|---|---|
+| 0 | `pending_requests` |
+| 1 | `sla_urgency` (derived from oldest wait) |
+| 2 | `request_rate` |
+| 3 | `delta_rate` (change in rate) |
+| 4 | `since_serve_ms` |
+| 5 | `batch_fill_ratio` |
+| 6 | `time_of_day_sin` |
+| 7 | `time_of_day_cos` |
 
 ### Action Space
-`Discrete(2)` — **0 = Wait**, **1 = Serve**
+`Discrete(4)` — **0 = Serve Now**, **1 = Wait 20ms**, **2 = Wait 50ms**, **3 = Wait 100ms**
 
 ### Reward Function
 ```
-r = α · batch_size  −  β · oldest_wait_ms  −  γ · idle_penalty
+r = α · batch_size  −  β · oldest_wait_ms
 ```
-With an additional **−5.0 SLA violation penalty** if `oldest_wait_ms > 500 ms`.
 
-| Term | Value | Purpose |
-|---|---|---|
-| α | 1.0 | Reward for serving larger batches (efficiency) |
-| β | 0.01 | Penalise keeping requests waiting (latency) |
-| γ | 0.1 | Penalise idling when queue is empty |
-
-### Why PPO over Q-learning?
-The state space is **continuous** — tabular Q-learning is inapplicable, and DQN would require discretisation. PPO is an **on-policy actor-critic** algorithm that directly optimises a clipped surrogate objective, making it stable for continuous-state, discrete-action problems without manually tuning exploration parameters. The **entropy bonus** (`ent_coef=0.01`) prevents the policy from collapsing prematurely to a greedy strategy before it has fully explored timing trade-offs.
+### Why SAC + LSTM + PER over PPO?
+While PPO is a strong baseline, dynamic web traffic (e.g., bursty or time-varying) contains partial observability and rapid distribution shifts. 
+- **LSTM**: Captures temporal trends (like rising traffic spikes) across the last `N` steps, solving the partial observability problem.
+- **SAC**: An off-policy algorithm that maximizes both expected reward and policy entropy, preventing premature convergence and exploring wait/serve trade-offs more smoothly.
+- **PER**: Prioritized Experience Replay ensures the network learns rapidly from rare, high-mistake states (like sudden SLA violations) instead of uniformly sampling boring "Wait" decisions.
 
 ---
 
 ## Project Structure
 
 ```
-Rl project gooooo/
-├── config.py                  # All hyperparameters + EXPERIMENT_CONFIGS
+Rl project/
+├── config.py                  # All hyperparameters for SAC and environments
 ├── run_all.py                 # End-to-end pipeline orchestrator
-├── test_baselines.py          # Quick check_env + baseline comparison
+├── plot_results.py            # Generates data visualizations
 │
 ├── env/
-│   ├── batching_env.py        # Gymnasium BatchingEnv (gym.Env subclass)
-│   └── traffic_generator.py   # Poisson arrival generator w/ time-of-day scaling
+│   ├── batching_env.py        # Base Gymnasium BatchingEnv 
+│   └── traffic_generator.py   # Poisson, bursty, and time-varying traffic generators
 │
-├── baselines/
-│   ├── cloudflare_formula.py  # P(serve) = exp(−λ·remaining_time) + evaluate_baseline()
-│   ├── greedy_agent.py        # Always-serve baseline
-│   └── random_agent.py        # Uniform-random baseline
+├── sac_agent/
+│   ├── sac_agent.py           # Core SAC algorithm implementation
+│   ├── network.py             # Actor and Critic networks (with LSTM)
+│   ├── replay_buffer.py       # Prioritized Experience Replay (PER) buffer
+│   ├── extended_env.py        # 8D state wrapper for complex traffic
+│   ├── train_sac.py           # Training loop
+│   └── evaluate_sac.py        # Evaluation script vs baseline heuristics
 │
-├── agent/
-│   ├── train.py               # PPO training (SB3): 4 envs, 500k steps, callbacks
-│   └── evaluate.py            # 30-ep eval + comparison plots + decision heatmap
-│
-├── demo/
-│   └── live_demo.py           # Real-time matplotlib animation (FuncAnimation)
-│
-├── results/
-│   ├── ablation_study.py      # Feature-importance ablation (ZeroFeatureWrapper)
-│   ├── comparison_plots.png   # ← generated by evaluate.py
-│   ├── decision_heatmap.png   # ← generated by evaluate.py
-│   └── ablation.png           # ← generated by ablation_study.py
-│
-├── models/
-│   ├── ppo_batching_final.zip # Final trained model
-│   └── best/best_model.zip    # Best checkpoint (by eval reward)
-│
-└── tensorboard_logs/          # TensorBoard event files
+├── results/                   # Evaluation plots and JSON summaries
+├── checkpoints_sac/           # Saved PyTorch models
+└── logs_sac/                  # Training metrics logic
 ```
-
----
-
-## Running Experiments at Different Traffic Loads
-
-`config.py` exports `EXPERIMENT_CONFIGS` with three pre-set traffic regimes:
-
-```python
-from config import EXPERIMENT_CONFIGS
-from env.batching_env import BatchingEnv
-
-# Pick one: "low_load" (5 req/s), "standard" (10 req/s), "high_load" (50 req/s)
-env = BatchingEnv(config=EXPERIMENT_CONFIGS["high_load"])
-```
-
----
-
-## Results
-
-| Agent | Mean Reward | p50 Latency (ms) | Avg Batch Size |
-|---|---|---|---|
-| **PPO (trained)** | *see results/comparison_plots.png* | — | — |
-| Greedy (always serve) | ~+877 | ~5 | ~0.1 |
-| Random | ~+481 | ~15 | — |
-| Cloudflare formula | ~−6198 | ~193 | — |
-
-See `results/comparison_plots.png` for the full agent comparison, and `results/decision_heatmap.png` for the PPO policy's learned decision boundary (P(serve) as a function of queue size and oldest wait time).

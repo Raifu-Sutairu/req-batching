@@ -34,11 +34,8 @@ except ImportError:
     from sac_agent.sac_agent import SACAgent
     from sac_agent.extended_env import make_extended_env, STATE_DIM
 
-try:
-    from stable_baselines3 import PPO
-    HAS_SB3 = True
-except ImportError:
-    HAS_SB3 = False
+HAS_SB3 = False
+
 
 os.makedirs("results", exist_ok=True)
 
@@ -121,10 +118,7 @@ def evaluate_agent_stratified(agent, traffic_pattern, n_peak=100, n_offpeak=100,
 
             done = False
             while not done:
-                if is_sb3:
-                    raw_action, _ = agent.predict(state, deterministic=deterministic)
-                    action = 0  # SB3 PPO maps to serve_now in extended env
-                elif hasattr(agent, "select_action"):
+                if hasattr(agent, "select_action"):
                     action = agent.select_action(state, deterministic=deterministic)
                 else:
                     action = agent(state)
