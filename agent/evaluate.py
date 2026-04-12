@@ -1,179 +1,202 @@
 """
 agent/evaluate.py
 
-Evaluation script: compares the trained PPO agent against all 3 baselines
-over 30 episodes each, then generates comparison figures.
+Evaluation: PPO vs Discrete SAC vs Cloudflare baseline.
 
-Outputs
--------
-results/comparison_plots.png  — 3-panel agent comparison figure
-results/decision_heatmap.png  — P(serve) heatmap over (batch_size × oldest_wait_ms)
-Terminal                      — formatted summary table
+Generates
+─────────
+  results/comparison.png           – 6-panel comparison (dark theme)
+  results/comparison_paper.png     – same figure, white-background research style
+  results/decision_heatmap.png     – 2×2 PPO heatmap (dark)
+  results/decision_heatmap_paper.png – same heatmap, paper style
+  results/traffic_regimes.png      – regime robustness (dark)
+  results/traffic_regimes_paper.png  – regime robustness (paper style)
+  stdout                           – formatted summary table
 
 Usage
------
+─────
     python agent/evaluate.py
-    python agent/evaluate.py --model models/best/best_model
+    python agent/evaluate.py --ppo-model models/ppo_final
+    python agent/evaluate.py --skip-heatmap --skip-regimes
 """
 
 import os
 import sys
 import argparse
-import warnings
+import contextlib
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, ROOT)
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")  # headless; works in any environment
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from matplotlib.ticker import MultipleLocator
-from stable_baselines3 import PPO, DQN
-from sb3_contrib import RecurrentPPO
+from matplotlib.colors import TwoSlopeNorm
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
 
-from env.batching_env import BatchingEnv
-from baselines.cloudflare_formula import CloudflareBaseline, evaluate_baseline
-from baselines.random_agent import RandomAgent
-from baselines.greedy_agent import GreedyAgent
-from config import CONFIG
+from env.batching_env import BatchingEnv, gpu_processing_ms
+from baselines.cloudflare_formula import CloudflareBaseline, GreedyBatchBaseline
+from agent.discrete_sac import DiscreteSAC
+from agent.d3qn import D3QN
+from config import CONFIG, SAC_CONFIG, D3QN_CONFIG, EXPERIMENT_CONFIGS
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-RESULTS_DIR      = os.path.join(ROOT, "results")
-PLOT_PATH        = os.path.join(RESULTS_DIR, "comparison_plots.png")
-HEATMAP_PATH     = os.path.join(RESULTS_DIR, "decision_heatmap.png")
-DEFAULT_MODEL    = os.path.join(ROOT, "models", "best", "best_model")
+# ── Paths ──────────────────────────────────────────────────────────────────────
+RESULTS_DIR         = os.path.join(ROOT, "results")
 os.makedirs(RESULTS_DIR, exist_ok=True)
+
+DEFAULT_PPO_MODEL   = os.path.join(ROOT, "models", "ppo_final")
+DEFAULT_SAC_MODEL   = os.path.join(ROOT, "models", "sac_final")
+DEFAULT_D3QN_MODEL  = os.path.join(ROOT, "models", "d3qn_final")
+PPO_VECNORM         = os.path.join(ROOT, "models", "ppo_vecnorm.pkl")
+SAC_VECNORM         = os.path.join(ROOT, "models", "sac_vecnorm.pkl")
+D3QN_VECNORM        = os.path.join(ROOT, "models", "d3qn_vecnorm.pkl")
 
 N_EPISODES  = 30
 SEED_OFFSET = 100
 
-# ── Dark-theme palette ─────────────────────────────────────────────────────────
-BG_FIGURE  = "#0a0e1a"
-BG_AXES    = "#141c30"
-TEXT_COLOR = "#e8eaf6"
-GRID_COLOR = "#2a3450"
-SPINE_COLOR= "#2a3450"
+# ── Colour palettes ────────────────────────────────────────────────────────────
+# Dark theme
+DARK_BG    = "#0a0e1a"
+DARK_AX    = "#141c30"
+DARK_FG    = "#e8eaf6"
+DARK_GRID  = "#2a3450"
 
-AGENT_COLORS = {
-    "PPO":        "#00e5ff",   # cyan
-    "DQN":        "#76ff03",   # lime green
-    "RPPO":       "#e040fb",   # magenta
-    "Greedy":     "#7c4dff",   # purple
-    "Cloudflare": "#ff6f00",   # amber
-    "Random":     "#f44336",   # red
+DARK_COLORS = {
+    "PPO":         "#00e5ff",
+    "Discrete SAC":"#ff4081",
+    "D3QN":        "#69ff47",
+    "Cloudflare":  "#ff9100",
+    "GreedyBatch": "#b2ff59",
 }
-AGENT_ORDER = ["PPO", "DQN", "RPPO", "Greedy", "Cloudflare", "Random"]
+
+# Paper theme — Wong (2011) colorblind-safe palette
+PAPER_COLORS = {
+    "PPO":         "#0072B2",   # blue
+    "Discrete SAC":"#D55E00",   # vermillion
+    "D3QN":        "#CC79A7",   # reddish purple
+    "Cloudflare":  "#009E73",   # green
+    "GreedyBatch": "#E69F00",   # orange
+}
+
+AGENTS       = ["PPO", "Discrete SAC", "D3QN", "Cloudflare"]
+PAPER_AGENTS = ["PPO", "Discrete SAC", "D3QN", "Cloudflare"]
+
+# ── Matplotlib style contexts ──────────────────────────────────────────────────
+
+PAPER_RC = {
+    "figure.facecolor":  "white",
+    "axes.facecolor":    "white",
+    "axes.edgecolor":    "#444444",
+    "axes.grid":         True,
+    "grid.color":        "#E0E0E0",
+    "grid.linestyle":    "--",
+    "grid.linewidth":    0.5,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "font.family":       "DejaVu Sans",
+    "font.size":         10,
+    "axes.titlesize":    11,
+    "axes.labelsize":    10,
+    "xtick.labelsize":   9,
+    "ytick.labelsize":   9,
+    "legend.fontsize":   9,
+    "text.color":        "black",
+    "axes.labelcolor":   "black",
+    "xtick.color":       "black",
+    "ytick.color":       "black",
+    "axes.titlecolor":   "black",
+}
+
+@contextlib.contextmanager
+def paper_style():
+    with plt.rc_context(PAPER_RC):
+        yield
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data collection
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Agent wrappers ─────────────────────────────────────────────────────────────
 
 class PPOWrapper:
-    """Thin wrapper so PPO has the same predict(obs)->int interface as baselines."""
-    def __init__(self, model):
-        self.model = model
+    def __init__(self, model: PPO, vecnorm: VecNormalize | None = None):
+        self.model   = model
+        self.vecnorm = vecnorm
 
     def predict(self, obs: np.ndarray) -> int:
-        action, _ = self.model.predict(obs, deterministic=True)
-        return int(action)
-
-class DQNWrapper:
-    """Thin wrapper so DQN has the same predict(obs)->int interface as baselines.
-
-    DQN's predict() is the same signature as PPO's, but internally it is doing
-    something fundamentally different: it computes Q(s, a) for all actions and
-    returns argmax. When deterministic=True, it always picks the greedy action.
-    When deterministic=False, it uses ε-greedy during training.
-    """
-    def __init__(self, model):
-        self.model = model
-
-    def predict(self, obs: np.ndarray) -> int:
-        action, _ = self.model.predict(obs, deterministic=True)
-        return int(action)
-
-class RecurrentPPOWrapper:
-    """Wrapper for RecurrentPPO that correctly manages LSTM hidden states.
-
-    This wrapper is fundamentally different from PPOWrapper and DQNWrapper.
-    Standard feedforward models have a stateless predict() — you just pass
-    the observation and get an action.
-
-    RecurrentPPO is stateful: it requires you to track and pass the LSTM
-    hidden state (lstm_states) between consecutive steps within the same
-    episode, and explicitly tell it when a new episode begins
-    (episode_start=True) so it can reset the hidden state to zeros.
-
-    If you forget to pass lstm_states forward, the LSTM resets to zero at
-    every step — equivalent to a memoryless policy, completely defeating
-    the purpose of the recurrent architecture.
-
-    If you forget to reset lstm_states at episode boundaries, the LSTM
-    carries over stale memory from the previous episode into the new one,
-    causing incorrect, context-polluted predictions.
-
-    This wrapper handles all of that correctly so the evaluation loop in
-    collect_episode_data() does not need to change at all.
-    """
-
-    def __init__(self, model: RecurrentPPO):
-        self.model = model
-        self.lstm_states = None        # Tuple of (h_t, c_t) — starts as None
-        self.episode_started = True    # True at first step → resets LSTM to 0
-
-    def reset(self):
-        """Call this at the start of each new evaluation episode."""
-        self.lstm_states = None
-        self.episode_started = True
-
-    def predict(self, obs: np.ndarray) -> int:
-        """Predict action, carrying LSTM state forward between calls."""
-        import numpy as np_inner
-
-        # episode_starts shape must match n_envs — here n_envs=1 for eval.
-        ep_start = np_inner.array([self.episode_started], dtype=bool)
-
-        action, self.lstm_states = self.model.predict(
-            obs,
-            state=self.lstm_states,
-            episode_start=ep_start,
-            deterministic=True,
-        )
-        self.episode_started = False   # Subsequent steps in same episode
+        o = self.vecnorm.normalize_obs(obs) if self.vecnorm else obs
+        action, _ = self.model.predict(o, deterministic=True)
         return int(action)
 
 
-def collect_episode_data(agent, env, n_episodes: int, seed_offset: int) -> dict:
-    """Run agent for n_episodes and collect detailed per-step data.
+class SACWrapper:
+    def __init__(self, model: DiscreteSAC, vecnorm: VecNormalize | None = None):
+        self.model   = model
+        self.vecnorm = vecnorm
 
-    Returns
-    -------
-    dict with keys:
-        rewards        : list[float]  — total reward per episode
-        batch_sizes    : list[int]    — batch size at every Serve action
-        latencies      : list[float]  — per-request latency at every Serve
-        throughputs    : list[int]    — total requests served per episode
-        sla_violations : list[int]    — Serve actions that occurred after SLA breach
-        n_serve_actions: list[int]    — total Serve actions per episode
-    """
-    sla_ms      = CONFIG["max_latency_ms"]
-    rewards         = []
-    batch_sizes     = []
-    latencies       = []
-    throughputs     = []
-    sla_violations  = []
-    n_serve_actions = []
+    def predict(self, obs: np.ndarray) -> int:
+        o = self.vecnorm.normalize_obs(obs) if self.vecnorm else obs
+        return self.model.predict(o, deterministic=True)
+
+
+class D3QNWrapper:
+    def __init__(self, model: D3QN, vecnorm: VecNormalize | None = None):
+        self.model   = model
+        self.vecnorm = vecnorm
+
+    def predict(self, obs: np.ndarray) -> int:
+        o = self.vecnorm.normalize_obs(obs) if self.vecnorm else obs
+        return self.model.predict(o, deterministic=True)
+
+
+# ── Model loaders ──────────────────────────────────────────────────────────────
+
+def _load_ppo(model_path: str, vecnorm_path: str) -> PPOWrapper:
+    m = PPO.load(model_path)
+    v = None
+    if vecnorm_path and os.path.exists(vecnorm_path):
+        dummy = DummyVecEnv([lambda: BatchingEnv()])
+        v = VecNormalize.load(vecnorm_path, dummy)
+        v.training = False; v.norm_reward = False
+    return PPOWrapper(m, v)
+
+
+def _load_sac(model_path: str, vecnorm_path: str) -> SACWrapper:
+    obs_dim   = BatchingEnv().observation_space.shape[0]
+    n_actions = BatchingEnv().action_space.n
+    m = DiscreteSAC.load(model_path, obs_dim=obs_dim, n_actions=n_actions, cfg=SAC_CONFIG)
+    v = None
+    if vecnorm_path and os.path.exists(vecnorm_path):
+        dummy = DummyVecEnv([lambda: BatchingEnv()])
+        v = VecNormalize.load(vecnorm_path, dummy)
+        v.training = False; v.norm_reward = False
+    return SACWrapper(m, v)
+
+
+def _load_d3qn(model_path: str, vecnorm_path: str) -> D3QNWrapper:
+    obs_dim   = BatchingEnv().observation_space.shape[0]
+    n_actions = BatchingEnv().action_space.n
+    m = D3QN.load(model_path, obs_dim=obs_dim, n_actions=n_actions, cfg=D3QN_CONFIG)
+    v = None
+    if vecnorm_path and os.path.exists(vecnorm_path):
+        dummy = DummyVecEnv([lambda: BatchingEnv()])
+        v = VecNormalize.load(vecnorm_path, dummy)
+        v.training = False; v.norm_reward = False
+    return D3QNWrapper(m, v)
+
+
+# ── Data collection ────────────────────────────────────────────────────────────
+
+def collect(agent, env: BatchingEnv, n_episodes: int, seed_offset: int) -> dict:
+    rewards, latency_raw, all_batch_sizes = [], [], []
+    throughputs, sla_viol_rates, n_dispatches = [], [], []
 
     for ep in range(n_episodes):
-        obs, info = env.reset(seed=seed_offset + ep)
-        total_reward  = 0.0
+        obs, _      = env.reset(seed=seed_offset + ep)
+        ep_reward   = 0.0
+        ep_dispatch = 0
+        prev_served = 0
         terminated = truncated = False
-        prev_served   = 0
-        ep_sla_viols  = 0
-        ep_serve_acts = 0
 
         if hasattr(agent, "reset"):
             agent.reset()
@@ -181,512 +204,549 @@ def collect_episode_data(agent, env, n_episodes: int, seed_offset: int) -> dict:
         while not (terminated or truncated):
             action = agent.predict(obs)
             obs, reward, terminated, truncated, info = env.step(action)
-            total_reward += reward
-
+            ep_reward += reward
             if action == 1:
-                ep_serve_acts += 1
+                ep_dispatch += 1
                 served_now = info["total_served"] - prev_served
-                if served_now > 0:
-                    batch_sizes.append(served_now)
-                    if info["mean_latency_ms"] > 0:
-                        latencies.append(info["mean_latency_ms"])
-                    # SLA: oldest_wait_ms is obs[1] after the step
-                    if float(obs[1]) > sla_ms:
-                        ep_sla_viols += 1
                 prev_served = info["total_served"]
+                if served_now > 0:
+                    all_batch_sizes.append(served_now)
 
-        rewards.append(total_reward)
+        latency_raw.extend(env._latency_samples)
+        rewards.append(ep_reward)
         throughputs.append(info["total_served"])
-        sla_violations.append(ep_sla_viols)
-        n_serve_actions.append(ep_serve_acts)
+        sla_viol_rates.append(info["sla_violation_rate"])
+        n_dispatches.append(ep_dispatch)
 
     return {
-        "rewards":         rewards,
-        "batch_sizes":     batch_sizes,
-        "latencies":       latencies,
-        "throughputs":     throughputs,
-        "sla_violations":  sla_violations,
-        "n_serve_actions": n_serve_actions,
+        "rewards":        rewards,
+        "latency_raw":    latency_raw,
+        "batch_sizes":    all_batch_sizes,
+        "throughputs":    throughputs,
+        "sla_viol_rates": sla_viol_rates,
+        "n_dispatches":   n_dispatches,
     }
 
 
-def run_all_agents(model_path: str) -> dict[str, dict]:
-    """Evaluate PPO + all baselines; return data dict keyed by agent name."""
-    env = BatchingEnv()
-
-    # Build agents
-    # --- Resolve DQN model path ---
-    dqn_best  = os.path.join(ROOT, "models", "dqn_best", "best_model")
-    dqn_final = os.path.join(ROOT, "models", "dqn_batching_final")
-    if os.path.exists(dqn_best + ".zip") or os.path.exists(dqn_best):
-        dqn_path = dqn_best
-    elif os.path.exists(dqn_final + ".zip") or os.path.exists(dqn_final):
-        dqn_path = dqn_final
-    else:
-        dqn_path = None
-        print("  [WARN] DQN model not found — run agent/train_dqn.py first.")
-
-     # --- Resolve RPPO model path ---
-    rppo_best  = os.path.join(ROOT, "models", "rppo_best", "best_model")
-    rppo_final = os.path.join(ROOT, "models", "rppo_batching_final")
-    if os.path.exists(rppo_best + ".zip") or os.path.exists(rppo_best):
-        rppo_path = rppo_best
-    elif os.path.exists(rppo_final + ".zip") or os.path.exists(rppo_final):
-        rppo_path = rppo_final
-    else:
-        rppo_path = None
-        print("  [WARN] RPPO model not found — run agent/train_rppo.py first.")
-
+def run_all(ppo_path: str, ppo_vn: str,
+            sac_path: str, sac_vn: str,
+            d3qn_path: str, d3qn_vn: str) -> dict[str, dict]:
+    env    = BatchingEnv()
     agents = {
-        "PPO":        PPOWrapper(PPO.load(model_path, env=env)),
-        "RPPO":       RecurrentPPOWrapper(RecurrentPPO.load(rppo_path, env=env)) if rppo_path else RandomAgent(seed=1),
-        "DQN":        DQNWrapper(DQN.load(dqn_path, env=env)) if dqn_path else RandomAgent(seed=0),
-        "Greedy":     GreedyAgent(),
-        "Cloudflare": CloudflareBaseline(
-                          max_latency_ms=CONFIG["max_latency_ms"], seed=42),
-        "Random":     RandomAgent(seed=42),
+        "PPO":         _load_ppo(ppo_path, ppo_vn),
+        "Discrete SAC":_load_sac(sac_path, sac_vn),
+        "D3QN":        _load_d3qn(d3qn_path, d3qn_vn),
+        "Cloudflare":  CloudflareBaseline(),
+        "GreedyBatch": GreedyBatchBaseline(),
     }
-
     all_data = {}
-    for name in AGENT_ORDER:
-        print(f"  Evaluating {name:12s} ({N_EPISODES} episodes) ...", end=" ", flush=True)
-        data = collect_episode_data(agents[name], env, N_EPISODES, SEED_OFFSET)
-        all_data[name] = data
-        mean_r = np.mean(data["rewards"])
-        print(f"mean reward = {mean_r:+.2f}")
-
+    for name in AGENTS + ["GreedyBatch"]:
+        print(f"  Evaluating {name:<14} ({N_EPISODES} eps) …", end=" ", flush=True)
+        d = collect(agents[name], env, N_EPISODES, SEED_OFFSET)
+        all_data[name] = d
+        print(f"reward = {np.mean(d['rewards']):+.0f}")
     env.close()
     return all_data
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Plotting helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _apply_dark_style(ax):
-    """Apply dark styling to a single Axes."""
-    ax.set_facecolor(BG_AXES)
-    for spine in ax.spines.values():
-        spine.set_edgecolor(SPINE_COLOR)
-    ax.tick_params(colors=TEXT_COLOR, labelsize=9)
-    ax.xaxis.label.set_color(TEXT_COLOR)
-    ax.yaxis.label.set_color(TEXT_COLOR)
-    ax.title.set_color(TEXT_COLOR)
-    ax.grid(True, color=GRID_COLOR, linewidth=0.6, alpha=0.8)
-
-
-def plot_reward_bars(ax, data: dict[str, dict]):
-    """Panel 1: Bar chart of mean ± std reward."""
-    means = [np.mean(data[n]["rewards"])   for n in AGENT_ORDER]
-    stds  = [np.std(data[n]["rewards"])    for n in AGENT_ORDER]
-    colors= [AGENT_COLORS[n]               for n in AGENT_ORDER]
-    x     = np.arange(len(AGENT_ORDER))
-
-    bars = ax.bar(x, means, yerr=stds, color=colors, width=0.55,
-                  capsize=6, error_kw=dict(color=TEXT_COLOR, linewidth=1.5),
-                  alpha=0.88, zorder=3)
-
-    # Value labels
-    for bar, mean in zip(bars, means):
-        va  = "bottom" if mean >= 0 else "top"
-        off = 5 if mean >= 0 else -5
-        ax.annotate(
-            f"{mean:+.0f}",
-            xy=(bar.get_x() + bar.get_width() / 2, mean),
-            xytext=(0, off),
-            textcoords="offset points",
-            ha="center", va=va,
-            color=TEXT_COLOR, fontsize=8.5, fontweight="bold",
-        )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(AGENT_ORDER, color=TEXT_COLOR)
-    ax.axhline(0, color=TEXT_COLOR, linewidth=0.7, linestyle="--", alpha=0.5)
-    ax.set_title("Mean Episode Reward ± Std", fontweight="bold", fontsize=11)
-    ax.set_ylabel("Episode Reward", labelpad=8)
-    _apply_dark_style(ax)
+def run_regimes(ppo_path: str, ppo_vn: str,
+                sac_path: str, sac_vn: str,
+                d3qn_path: str, d3qn_vn: str,
+                n_episodes: int = 8) -> dict[str, dict[str, dict]]:
+    regime_keys = {
+        "off_peak":  "Off-Peak\n(400 req/s)",
+        "standard":  "Standard\n(2 000 req/s)",
+        "peak_load": "Peak Load\n(5 000 req/s)",
+    }
+    results = {}
+    for key, label in regime_keys.items():
+        cfg = EXPERIMENT_CONFIGS[key]
+        env = BatchingEnv(config=cfg)
+        agents = {
+            "PPO":         _load_ppo(ppo_path, ppo_vn),
+            "Discrete SAC":_load_sac(sac_path, sac_vn),
+            "D3QN":        _load_d3qn(d3qn_path, d3qn_vn),
+            "Cloudflare":  CloudflareBaseline(config=cfg),
+        }
+        regime_data = {}
+        for name in PAPER_AGENTS:
+            regime_data[name] = collect(agents[name], env, n_episodes, SEED_OFFSET + 200)
+        env.close()
+        results[label] = regime_data
+        print("    " + label.replace("\n", " ") + "  " +
+              "  ".join(f"{n}={np.mean(regime_data[n]['rewards']):+.0f}"
+                        for n in PAPER_AGENTS))
+    return results
 
 
-def plot_batch_histogram(ax, data: dict[str, dict]):
-    """Panel 2: Overlapping histogram of batch size distributions."""
-    has_data = False
-    for name in AGENT_ORDER:
+# ── Panel helpers ──────────────────────────────────────────────────────────────
+
+def _style_dark(ax, legend=None):
+    ax.set_facecolor(DARK_AX)
+    for sp in ax.spines.values(): sp.set_edgecolor(DARK_GRID)
+    ax.tick_params(colors=DARK_FG, labelsize=9)
+    ax.xaxis.label.set_color(DARK_FG); ax.yaxis.label.set_color(DARK_FG)
+    ax.title.set_color(DARK_FG)
+    ax.grid(True, color=DARK_GRID, linewidth=0.5, alpha=0.8)
+    if legend:
+        legend.get_frame().set(facecolor=DARK_AX, edgecolor=DARK_GRID)
+        for t in legend.get_texts(): t.set_color(DARK_FG)
+
+
+def _style_paper(ax, legend=None):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, color="#E0E0E0", linestyle="--", linewidth=0.5)
+    if legend:
+        legend.get_frame().set(facecolor="white", edgecolor="#CCCCCC")
+
+
+def _annotate_bars(ax, bars, values, fmt="{:.0f}", color="black", yoff=4):
+    for bar, v in zip(bars, values):
+        ax.annotate(fmt.format(v),
+                    xy=(bar.get_x() + bar.get_width() / 2, v),
+                    xytext=(0, yoff), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=8, color=color,
+                    fontweight="bold")
+
+
+# ── Comparison panels (theme-agnostic content) ─────────────────────────────────
+
+def _panel_reward(ax, data, colors, style_fn, fg="black"):
+    means  = [np.mean(data[n]["rewards"]) for n in PAPER_AGENTS]
+    stds   = [np.std(data[n]["rewards"])  for n in PAPER_AGENTS]
+    x      = np.arange(len(PAPER_AGENTS))
+    bars   = ax.bar(x, means, yerr=stds, color=[colors[n] for n in PAPER_AGENTS],
+                    width=0.55, capsize=5, alpha=0.88, zorder=3,
+                    error_kw={"color": fg, "linewidth": 1.2})
+    _annotate_bars(ax, bars, means, fmt="{:+.0f}", color=fg)
+    ax.set_xticks(x); ax.set_xticklabels(PAPER_AGENTS)
+    ax.axhline(0, color=fg, linewidth=0.6, linestyle="--", alpha=0.4)
+    ax.set_title("Mean Episode Reward ± Std", fontweight="bold")
+    ax.set_ylabel("Episode Reward")
+    style_fn(ax)
+
+
+def _panel_latency_bars(ax, data, colors, style_fn, fg="black"):
+    sla   = CONFIG["max_latency_ms"]
+    width = 0.22
+    x     = np.arange(len(PAPER_AGENTS))
+    pcts  = [50, 95, 99]
+    alphas= [0.90, 0.65, 0.40]
+    for i, (pct, al) in enumerate(zip(pcts, alphas)):
+        vals = [float(np.percentile(data[n]["latency_raw"], pct))
+                if data[n]["latency_raw"] else 0.0 for n in PAPER_AGENTS]
+        bars = ax.bar(x + (i-1)*width, vals, width, label=f"P{pct}",
+                      color=[colors[n] for n in PAPER_AGENTS], alpha=al, zorder=3)
+        if pct == 99:
+            for b in bars: b.set_hatch("//")
+    ax.axhline(sla, color="#CC0000", linewidth=1.2, linestyle=":",
+               alpha=0.8, label=f"SLA ({sla} ms)")
+    ax.set_xticks(x); ax.set_xticklabels(PAPER_AGENTS)
+    leg = ax.legend(fontsize=8, loc="upper right")
+    ax.set_title("P50 / P95 / P99 Total Latency", fontweight="bold")
+    ax.set_ylabel("Latency (ms)")
+    style_fn(ax, leg)
+
+
+def _panel_batch_dist(ax, data, colors, style_fn, fg="black"):
+    for name in PAPER_AGENTS:
         bs = data[name]["batch_sizes"]
-        if not bs:
-            continue
-        has_data = True
-        ax.hist(
-            bs,
-            bins=30,
-            range=(0, CONFIG["max_batch_size"]),
-            alpha=0.45,
-            color=AGENT_COLORS[name],
-            label=name,
-            density=True,
-            edgecolor="none",
-        )
-        # Overlay a smooth KDE-style line
-        from scipy.stats import gaussian_kde  # optional import; falls back
+        if not bs: continue
+        ax.hist(bs, bins=40, range=(0, CONFIG["max_batch_size"]),
+                alpha=0.40, color=colors[name], label=name, density=True)
         try:
-            if len(set(bs)) > 1:
-                kde = gaussian_kde(bs, bw_method=0.25)
+            from scipy.stats import gaussian_kde
+            if len(set(bs)) > 3:
+                kde = gaussian_kde(bs, bw_method=0.2)
                 xs  = np.linspace(0, CONFIG["max_batch_size"], 300)
-                ax.plot(xs, kde(xs), color=AGENT_COLORS[name], linewidth=1.8)
+                ax.plot(xs, kde(xs), color=colors[name], linewidth=2.0)
         except Exception:
             pass
-
-    if not has_data:
-        ax.text(0.5, 0.5, "No serve actions recorded",
-                transform=ax.transAxes, ha="center", va="center",
-                color=TEXT_COLOR, fontsize=10)
-
-    legend = ax.legend(
-        facecolor=BG_AXES, edgecolor=SPINE_COLOR,
-        labelcolor=TEXT_COLOR, fontsize=8
-    )
-    ax.set_title("Batch Size Distribution", fontweight="bold", fontsize=11)
+    leg = ax.legend(fontsize=8)
+    ax.set_title("Batch Size Distribution", fontweight="bold")
     ax.set_xlabel("Batch Size (requests)")
     ax.set_ylabel("Density")
-    _apply_dark_style(ax)
+    style_fn(ax, leg)
 
 
-def plot_latency_cdf(ax, data: dict[str, dict]):
-    """Panel 3: Latency CDF curves (lower-left = better)."""
+def _panel_latency_cdf(ax, data, colors, style_fn, fg="black"):
     sla = CONFIG["max_latency_ms"]
-    plotted = False
-
-    for name in AGENT_ORDER:
-        lat = data[name]["latencies"]
-        if not lat:
-            continue
-        plotted = True
-        sorted_lat = np.sort(lat)
-        cdf = np.arange(1, len(sorted_lat) + 1) / len(sorted_lat)
-        ax.plot(sorted_lat, cdf,
-                color=AGENT_COLORS[name],
-                linewidth=2.0,
-                label=name,
-                alpha=0.9)
-
-    # SLA deadline vertical
-    ax.axvline(sla, color="#ffffff", linewidth=1.0, linestyle=":",
-               alpha=0.6, label=f"SLA ({sla} ms)")
-
-    if not plotted:
-        ax.text(0.5, 0.5, "No latency data collected",
-                transform=ax.transAxes, ha="center", va="center",
-                color=TEXT_COLOR, fontsize=10)
-
-    legend = ax.legend(
-        facecolor=BG_AXES, edgecolor=SPINE_COLOR,
-        labelcolor=TEXT_COLOR, fontsize=8
-    )
-    ax.set_title("Serve Latency CDF  (lower-left = better)",
-                 fontweight="bold", fontsize=11)
-    ax.set_xlabel("Latency (ms)")
-    ax.set_ylabel("Cumulative Probability")
-    ax.set_ylim(0, 1.05)
-    _apply_dark_style(ax)
+    for name in PAPER_AGENTS:
+        raw = np.sort(np.array(data[name]["latency_raw"]))
+        if raw.size == 0: continue
+        cdf = np.arange(1, len(raw) + 1) / len(raw) * 100
+        ax.plot(raw, cdf, color=colors[name], linewidth=2.2, label=name, alpha=0.9)
+        p95 = float(np.percentile(raw, 95))
+        ax.axvline(p95, color=colors[name], linewidth=0.8, linestyle="--", alpha=0.45)
+    ax.axvline(sla, color="#CC0000", linewidth=1.4, linestyle=":",
+               alpha=0.85, label=f"SLA ({sla} ms)")
+    ax.set_xlabel("Total Latency (ms)")
+    ax.set_ylabel("Cumulative Requests (%)")
+    ax.set_ylim(0, 102); ax.set_xlim(left=0)
+    leg = ax.legend(fontsize=8, loc="lower right")
+    ax.set_title("Latency CDF — Client-Perceived Latency", fontweight="bold")
+    ax.axhspan(95, 100, color="#CC0000", alpha=0.05, zorder=0)
+    ax.text(ax.get_xlim()[1]*0.98, 97, "tail (P95+)",
+            ha="right", va="center", color="#CC0000", fontsize=7.5, alpha=0.7)
+    style_fn(ax, leg)
 
 
-def plot_throughput_bars(ax, data: dict[str, dict]):
-    """Panel 4: Bar chart of mean throughput (requests served per episode)."""
-    means  = [np.mean(data[n].get("throughputs", [0])) for n in AGENT_ORDER]
-    stds   = [np.std(data[n].get("throughputs", [0]))  for n in AGENT_ORDER]
-    colors = [AGENT_COLORS[n]                           for n in AGENT_ORDER]
-    x      = np.arange(len(AGENT_ORDER))
-
-    bars = ax.bar(x, means, yerr=stds, color=colors, width=0.55,
-                  capsize=6, error_kw=dict(color=TEXT_COLOR, linewidth=1.5),
-                  alpha=0.88, zorder=3)
-
-    for bar, mean in zip(bars, means):
-        ax.annotate(
-            f"{mean:,.0f}",
-            xy=(bar.get_x() + bar.get_width() / 2, mean),
-            xytext=(0, 5), textcoords="offset points",
-            ha="center", va="bottom",
-            color=TEXT_COLOR, fontsize=8.5, fontweight="bold",
-        )
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(AGENT_ORDER, color=TEXT_COLOR)
-    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: f"{v:,.0f}"))
-    ax.set_title("Throughput — Requests Served / Episode", fontweight="bold", fontsize=11)
-    ax.set_ylabel("Requests Served", labelpad=8)
-    ax.text(0.98, 0.96, "↑ higher is better", transform=ax.transAxes,
-            ha="right", va="top", color="#7986cb", fontsize=8, fontstyle="italic")
-    _apply_dark_style(ax)
+def _panel_reward_per_dispatch(ax, data, colors, style_fn, fg="black"):
+    means, stds, names_ = [], [], []
+    for name in PAPER_AGENTS:
+        rp = np.array(data[name]["rewards"]) / np.maximum(data[name]["n_dispatches"], 1)
+        means.append(np.mean(rp)); stds.append(np.std(rp)); names_.append(name)
+    x    = np.arange(len(names_))
+    bars = ax.bar(x, means, yerr=stds, color=[colors[n] for n in names_],
+                  width=0.55, capsize=5, alpha=0.88, zorder=3,
+                  error_kw={"color": fg, "linewidth": 1.2})
+    _annotate_bars(ax, bars, means, fmt="{:.1f}", color=fg)
+    ax.set_xticks(x); ax.set_xticklabels(names_)
+    ax.set_title("Reward per Dispatch\n(↑ higher = smarter batching)", fontweight="bold")
+    ax.set_ylabel("Avg Reward / Dispatch")
+    style_fn(ax)
 
 
-def generate_figure(data: dict[str, dict]) -> str:
-    """Build a 2×2 four-panel figure, save it, and return the path."""
-    plt.rcParams.update({
-        "font.family":       "DejaVu Sans",
-        "text.color":        TEXT_COLOR,
-        "axes.labelcolor":   TEXT_COLOR,
-        "xtick.color":       TEXT_COLOR,
-        "ytick.color":       TEXT_COLOR,
-    })
-
-    fig, axes = plt.subplots(
-        2, 2,
-        figsize=(18, 12),
-        facecolor=BG_FIGURE,
-    )
-    fig.subplots_adjust(left=0.07, right=0.97, top=0.93, bottom=0.08,
-                        wspace=0.28, hspace=0.38)
-
-    fig.suptitle(
-        "Dynamic Request Batching — Agent Comparison",
-        color=TEXT_COLOR,
-        fontsize=15,
-        fontweight="bold",
-        y=0.97,
-    )
-
-    plot_reward_bars(axes[0, 0], data)
-    plot_batch_histogram(axes[0, 1], data)
-    plot_latency_cdf(axes[1, 0], data)
-    plot_throughput_bars(axes[1, 1], data)
-
-    # Shared legend
-    from matplotlib.patches import Patch
-    legend_elems = [
-        Patch(facecolor=AGENT_COLORS[n], label=n) for n in AGENT_ORDER
-    ]
-    fig.legend(
-        handles=legend_elems,
-        loc="lower center",
-        ncol=len(AGENT_ORDER),
-        facecolor=BG_AXES, edgecolor=GRID_COLOR,
-        labelcolor=TEXT_COLOR, fontsize=9,
-        bbox_to_anchor=(0.5, 0.01),
-        framealpha=0.85,
-    )
-
-    fig.savefig(PLOT_PATH, dpi=150, bbox_inches="tight", facecolor=BG_FIGURE)
-    plt.close(fig)
-    return PLOT_PATH
+def _panel_efficiency_scatter(ax, data, colors, style_fn, fg="black"):
+    for name in PAPER_AGENTS:
+        bs   = data[name]["batch_sizes"]
+        dp   = data[name]["n_dispatches"]
+        ax.scatter(np.mean(dp), np.mean(bs) if bs else 0,
+                   s=180, color=colors[name], label=name,
+                   zorder=4, edgecolors=fg, linewidths=0.7)
+        ax.annotate(name, (np.mean(dp), np.mean(bs) if bs else 0),
+                    textcoords="offset points", xytext=(7, 3),
+                    color=colors[name], fontsize=9, fontweight="bold")
+    ax.set_xlabel("Avg Dispatches per Episode")
+    ax.set_ylabel("Avg Batch Size (requests)")
+    ax.set_title("Dispatch Efficiency\n(↖ fewer dispatches, larger batches = better)", fontweight="bold")
+    style_fn(ax)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Decision heatmap
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Full comparison figure ─────────────────────────────────────────────────────
 
-def generate_decision_heatmap(model_path: str, grid_size: int = 50) -> str:
-    """Generate a P(serve) heatmap over a grid of (batch_size × oldest_wait_ms).
+def generate_figure(data: dict, style: str = "dark") -> str:
+    is_dark  = style == "dark"
+    colors   = DARK_COLORS if is_dark else PAPER_COLORS
+    bg_fig   = DARK_BG if is_dark else "white"
+    fg       = DARK_FG if is_dark else "black"
+    style_fn = _style_dark if is_dark else _style_paper
+    path     = os.path.join(RESULTS_DIR,
+                            "comparison.png" if is_dark else "comparison_paper.png")
 
-    The PPO policy network outputs a probability distribution over actions.
-    By sweeping two of the most interpretable state dimensions—how many requests
-    are waiting and how old the oldest one is—while holding the remaining dims
-    at their empirical mean values, we get a 2D slice through the policy's
-    decision surface.  This directly shows *where* in state-space the agent
-    prefers to serve vs. wait, which is the key learned batching heuristic.
+    rc = {"font.family": "DejaVu Sans", "text.color": fg} if is_dark else PAPER_RC
+    with plt.rc_context(rc):
+        fig, axes = plt.subplots(2, 3, figsize=(20, 11),
+                                 facecolor=bg_fig)
+        fig.subplots_adjust(left=0.07, right=0.97, top=0.92, bottom=0.09,
+                            wspace=0.33, hspace=0.46)
+        title_kw = dict(color=fg, fontsize=14, fontweight="bold", y=0.97)
+        fig.suptitle("Dynamic Request Batching — PPO vs SAC vs D3QN vs Cloudflare",
+                     **title_kw)
 
-    Parameters
-    ----------
-    model_path : str
-        Path to a saved SB3 PPO model (with or without .zip).
-    grid_size : int
-        Resolution of the sweep grid along each axis.
+        _panel_reward(axes[0, 0], data, colors, style_fn, fg)
+        _panel_latency_bars(axes[0, 1], data, colors, style_fn, fg)
+        _panel_batch_dist(axes[0, 2], data, colors, style_fn, fg)
+        _panel_reward_per_dispatch(axes[1, 0], data, colors, style_fn, fg)
+        _panel_latency_cdf(axes[1, 1], data, colors, style_fn, fg)
+        _panel_efficiency_scatter(axes[1, 2], data, colors, style_fn, fg)
 
-    Returns
-    -------
-    str
-        Path to the saved heatmap PNG.
-    """
+        legend_elems = [mpatches.Patch(facecolor=colors[n], label=n) for n in PAPER_AGENTS]
+        fig.legend(handles=legend_elems, loc="lower center", ncol=len(PAPER_AGENTS),
+                   facecolor=DARK_AX if is_dark else "white",
+                   edgecolor=DARK_GRID if is_dark else "#CCCCCC",
+                   labelcolor=fg, fontsize=9,
+                   bbox_to_anchor=(0.5, 0.01), framealpha=0.9)
+
+        fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=bg_fig)
+        plt.close(fig)
+    return path
+
+
+# ── Decision heatmap ──────────────────────────────────────────────────────────
+
+def generate_heatmap(ppo_path: str, ppo_vn: str,
+                     style: str = "dark", grid: int = 70) -> str:
     import torch
 
-    model = PPO.load(model_path)
+    ppo_model = PPO.load(ppo_path)
+    ppo_model.policy.set_training_mode(False)
+    vecnorm   = None
+    if ppo_vn and os.path.exists(ppo_vn):
+        dummy   = DummyVecEnv([lambda: BatchingEnv()])
+        vecnorm = VecNormalize.load(ppo_vn, dummy)
+        vecnorm.training = False; vecnorm.norm_reward = False
 
-    max_batch  = CONFIG["max_batch_size"]   # 100
-    max_lat    = CONFIG["max_latency_ms"]   # 500
+    max_b  = CONFIG["max_batch_size"]
+    max_w  = CONFIG["max_latency_ms"] // 2
+    rate_v = CONFIG["arrival_rate"] * 1.2
+    tod_v  = 14.0
+    trend_v= 0.0   # neutral rate trend
 
-    # ── Representative "mean" values for the 4 fixed dimensions ──────────────
-    # These come from a short rollout average so the heatmap reflects realistic
-    # context rather than arbitrary zeros.
-    arrival_rate_mean  = CONFIG["arrival_rate"] * CONFIG["peak_multiplier"] * 0.5
-    since_serve_mean   = 150.0   # ms — moderate time since last serve
-    fill_ratio_mean    = 0.3     # 30 % full — mid-episode typical
-    time_of_day_mean   = 13.0    # early afternoon
+    since_slices = [
+        (10,  "since_serve = 10 ms\n(just dispatched — expect Wait)"),
+        (40,  "since_serve = 40 ms\n(short gap)"),
+        (80,  "since_serve = 80 ms\n(medium gap)"),
+        (150, "since_serve = 150 ms\n(long idle — expect Serve)"),
+    ]
 
-    # ── Build observation grid ────────────────────────────────────────────────
-    batch_sizes  = np.linspace(0, max_batch, grid_size)
-    oldest_waits = np.linspace(0, max_lat,   grid_size)
+    batch_vals = np.linspace(0, max_b, grid)
+    wait_vals  = np.linspace(0, max_w, grid)
 
-    p_serve = np.zeros((grid_size, grid_size), dtype=np.float32)
+    is_dark  = style == "dark"
+    bg_fig   = DARK_BG if is_dark else "white"
+    fg       = DARK_FG if is_dark else "black"
+    ax_bg    = DARK_AX if is_dark else "white"
+    spine_c  = DARK_GRID if is_dark else "#888888"
+    path     = os.path.join(RESULTS_DIR,
+                            "decision_heatmap.png" if is_dark else "decision_heatmap_paper.png")
 
-    # PPO uses a categorical distribution over actions; we extract the raw
-    # log-probability of action=1 (Serve) from the policy network.
-    model.policy.set_training_mode(False)
-
-    for i, bs in enumerate(batch_sizes):
-        for j, ow in enumerate(oldest_waits):
-            obs = np.array([
-                bs,
-                ow,
-                arrival_rate_mean,
-                since_serve_mean,
-                bs / max(max_batch, 1),  # fill_ratio derived from bs
-                time_of_day_mean,
-            ], dtype=np.float32)
-
-            obs_t = torch.as_tensor(obs).unsqueeze(0)  # shape (1, 6)
-            with torch.no_grad():
-                dist = model.policy.get_distribution(
-                    model.policy.obs_to_tensor(obs)[0]
-                )
-                # log_prob for action=1 → exponentiate to get P(serve)
-                log_p = dist.distribution.logits[0, 1]  # logit for class 1
-                p     = torch.sigmoid(log_p).item()      # stable sigmoid
-            p_serve[j, i] = p  # rows = oldest_wait (y), cols = batch_size (x)
-
-    # ── Plot ──────────────────────────────────────────────────────────────────
-    plt.rcParams.update({
-        "font.family":  "DejaVu Sans",
-        "text.color":   TEXT_COLOR,
-    })
-
-    fig, ax = plt.subplots(figsize=(9, 7), facecolor=BG_FIGURE)
-    fig.subplots_adjust(left=0.10, right=0.92, top=0.90, bottom=0.12)
-
-    # Use a diverging colormap anchored at p=0.5 (decision boundary)
-    from matplotlib.colors import TwoSlopeNorm
-    norm  = TwoSlopeNorm(vmin=0.0, vcenter=0.5, vmax=1.0)
-    cmap  = plt.cm.RdYlGn   # red=Wait, green=Serve
-
-    im = ax.imshow(
-        p_serve,
-        origin="lower",
-        aspect="auto",
-        extent=[0, max_batch, 0, max_lat],
-        cmap=cmap,
-        norm=norm,
-        interpolation="bilinear",
-    )
-
-    # Contour at p=0.5 — the decision boundary
-    ax.contour(
-        np.linspace(0, max_batch, grid_size),
-        np.linspace(0, max_lat,   grid_size),
-        p_serve,
-        levels=[0.5],
-        colors=["white"],
-        linewidths=1.5,
-        linestyles="--",
-    )
-
-    # SLA deadline horizontal line
-    ax.axhline(max_lat, color="#ff5252", linewidth=1.2, linestyle=":",
-               alpha=0.8, label=f"SLA deadline ({max_lat} ms)")
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label("P(Serve)", color=TEXT_COLOR, fontsize=10)
-    cbar.ax.yaxis.set_tick_params(color=TEXT_COLOR)
-    cbar.ax.tick_params(colors=TEXT_COLOR)
-    plt.setp(cbar.ax.yaxis.get_ticklabels(), color=TEXT_COLOR)
-
-    ax.set_facecolor(BG_AXES)
-    for sp in ax.spines.values():
-        sp.set_edgecolor(SPINE_COLOR)
-    ax.tick_params(colors=TEXT_COLOR, labelsize=9)
-    ax.xaxis.label.set_color(TEXT_COLOR)
-    ax.yaxis.label.set_color(TEXT_COLOR)
-
-    ax.set_xlabel("Pending Batch Size (requests)", labelpad=8)
-    ax.set_ylabel("Oldest Request Wait (ms)", labelpad=8)
-    ax.set_title(
-        "PPO Decision Heatmap — P(Serve)\n"
-        "white dashed line = decision boundary (p = 0.5)",
-        color=TEXT_COLOR, fontsize=11, fontweight="bold", pad=10,
-    )
-    ax.legend(facecolor=BG_AXES, edgecolor=SPINE_COLOR,
-              labelcolor=TEXT_COLOR, fontsize=8, loc="upper left")
-
-    fig.text(
-        0.5, 0.01,
-        f"Other state dims fixed at:  rate={arrival_rate_mean:.0f} req/s  "
-        f"| since_serve={since_serve_mean:.0f} ms  "
-        f"| time_of_day={time_of_day_mean:.0f}h",
-        ha="center", color="#90a4ae", fontsize=7.5,
-    )
-
-    fig.savefig(HEATMAP_PATH, dpi=150, bbox_inches="tight", facecolor=BG_FIGURE)
-    plt.close(fig)
-    return HEATMAP_PATH
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Summary table
-# ─────────────────────────────────────────────────────────────────────────────
-
-def print_summary_table(data: dict[str, dict]):
-    W = 76
-    print("\n" + "=" * W)
-    print(f"{'Agent':<14}  {'Mean Reward':>12}  {'Std Reward':>10}  "
-          f"{'p50 Latency':>12}  {'p95 Latency':>12}  {'Avg Batch':>10}")
-    print("-" * W)
-    for name in AGENT_ORDER:
-        d = data[name]
-        mean_r = np.mean(d["rewards"])
-        std_r  = np.std(d["rewards"])
-        lats   = d["latencies"]
-        p50    = float(np.percentile(lats, 50)) if lats else float("nan")
-        p95    = float(np.percentile(lats, 95)) if lats else float("nan")
-        avg_bs = float(np.mean(d["batch_sizes"])) if d["batch_sizes"] else float("nan")
-        print(
-            f"{name:<14}  {mean_r:>+12.2f}  {std_r:>10.2f}  "
-            f"{p50:>12.1f}  {p95:>12.1f}  {avg_bs:>10.2f}"
+    rc = {"font.family": "DejaVu Sans"} if is_dark else PAPER_RC
+    with plt.rc_context(rc):
+        fig, axes = plt.subplots(2, 2, figsize=(14, 11), facecolor=bg_fig)
+        fig.subplots_adjust(left=0.08, right=0.91, top=0.90, bottom=0.08,
+                            wspace=0.30, hspace=0.40)
+        fig.suptitle(
+            "PPO Learned Policy — P(Serve) across Time-Since-Last-Dispatch\n"
+            "green = Serve  |  red = Wait  |  white dashed = P = 0.5 boundary",
+            color=fg, fontsize=12, fontweight="bold", y=0.97,
         )
+
+        norm  = TwoSlopeNorm(vmin=0.0, vcenter=0.5, vmax=1.0)
+        last_im = None
+
+        for idx, (since_ms, subtitle) in enumerate(since_slices):
+            ax = axes[idx // 2, idx % 2]
+            p_serve = np.zeros((grid, grid), dtype=np.float32)
+
+            for i, bs in enumerate(batch_vals):
+                est_proc = gpu_processing_ms(max(1, int(bs)), CONFIG)
+                budget   = max(1.0, CONFIG["max_latency_ms"] - est_proc)
+                for j, ow in enumerate(wait_vals):
+                    urgency = ow / budget
+                    fill    = bs / max(max_b, 1)
+                    obs = np.array([bs, ow, rate_v, since_ms, fill, tod_v,
+                                    urgency, trend_v], dtype=np.float32)
+                    if vecnorm is not None:
+                        obs = vecnorm.normalize_obs(obs)
+                    obs_t = ppo_model.policy.obs_to_tensor(obs)[0]
+                    with torch.no_grad():
+                        dist  = ppo_model.policy.get_distribution(obs_t)
+                        logit = dist.distribution.logits[0, 1]
+                        p     = torch.sigmoid(logit).item()
+                    p_serve[j, i] = p
+
+            last_im = ax.imshow(p_serve, origin="lower", aspect="auto",
+                                extent=[0, max_b, 0, max_w],
+                                cmap=plt.cm.RdYlGn, norm=norm, interpolation="bilinear")
+            try:
+                ax.contour(batch_vals, wait_vals, p_serve, levels=[0.5],
+                           colors=["white"], linewidths=2.0, linestyles="--")
+            except Exception:
+                pass
+
+            # SLA breach boundary
+            sla_y = [min(max_w, CONFIG["max_latency_ms"] -
+                         gpu_processing_ms(max(1, int(b)), CONFIG)) for b in batch_vals]
+            ax.plot(batch_vals, sla_y, color="#CC0000", lw=1.4, ls=":",
+                    alpha=0.85, label="SLA breach (urgency=1)")
+
+            # Cloudflare 80% threshold
+            cf_y = [min(max_w, 0.80 * max(50.0, CONFIG["max_latency_ms"] -
+                    CONFIG["gpu_base_ms"] - CONFIG["gpu_per_request_ms"] * max(1, int(b))))
+                    for b in batch_vals]
+            ax.plot(batch_vals, cf_y, color="#FF8C00", lw=1.2, ls="-.",
+                    alpha=0.75, label="Cloudflare 80% threshold")
+
+            ax.set_facecolor(ax_bg)
+            for sp in ax.spines.values(): sp.set_edgecolor(spine_c)
+            ax.tick_params(colors=fg, labelsize=8)
+            ax.xaxis.label.set_color(fg); ax.yaxis.label.set_color(fg)
+            ax.set_title(subtitle, color=fg, fontsize=9, fontweight="bold")
+            ax.set_xlabel("Pending Batch Size (requests)", labelpad=6)
+            ax.set_ylabel("Oldest Wait Time (ms)", labelpad=6)
+            if idx == 0:
+                leg = ax.legend(facecolor=ax_bg, edgecolor=spine_c,
+                                labelcolor=fg, fontsize=7.5, loc="upper left")
+
+        cax  = fig.add_axes([0.925, 0.15, 0.013, 0.70])
+        cbar = fig.colorbar(last_im, cax=cax)
+        cbar.set_label("P(Serve)", color=fg, fontsize=10)
+        cbar.ax.tick_params(colors=fg)
+        plt.setp(cbar.ax.yaxis.get_ticklabels(), color=fg)
+        fig.text(0.5, 0.01,
+                 f"Fixed: rate={rate_v:.0f} req/s  |  time_of_day=14:00  "
+                 f"|  rate_trend=0  |  since_serve varies across panels",
+                 ha="center", color="#90a4ae" if is_dark else "#666666", fontsize=8)
+
+        fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=bg_fig)
+        plt.close(fig)
+    return path
+
+
+# ── Traffic regime plot ────────────────────────────────────────────────────────
+
+def generate_regime_plot(regime_data: dict, style: str = "dark") -> str:
+    is_dark  = style == "dark"
+    colors   = DARK_COLORS if is_dark else PAPER_COLORS
+    bg_fig   = DARK_BG if is_dark else "white"
+    fg       = DARK_FG if is_dark else "black"
+    style_fn = _style_dark if is_dark else _style_paper
+    path     = os.path.join(RESULTS_DIR,
+                            "traffic_regimes.png" if is_dark else "traffic_regimes_paper.png")
+
+    regimes = list(regime_data.keys())
+    x       = np.arange(len(regimes))
+    w       = 0.23
+
+    rc = {"font.family": "DejaVu Sans", "text.color": fg} if is_dark else PAPER_RC
+    with plt.rc_context(rc):
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6), facecolor=bg_fig)
+        fig.subplots_adjust(left=0.07, right=0.97, top=0.88, bottom=0.18, wspace=0.38)
+        fig.suptitle("Traffic Regime Robustness — Off-Peak / Standard / Peak Load",
+                     color=fg, fontsize=13, fontweight="bold", y=0.97)
+
+        titles = [
+            ("Mean Reward\n(↑ higher is better)",
+             lambda d: np.mean(d["rewards"]),
+             "Episode Reward",
+             lambda v: f"{v/1000:.0f}k"),
+            ("P95 Total Latency\n(↓ lower is better)",
+             lambda d: float(np.percentile(d["latency_raw"], 95))
+                       if d["latency_raw"] else 0.0,
+             "Latency (ms)",
+             None),
+            ("Avg Batch Size\n(↑ larger = better GPU util)",
+             lambda d: np.mean(d["batch_sizes"]) if d["batch_sizes"] else 0.0,
+             "Avg Batch Size (requests)",
+             None),
+        ]
+
+        for (ax, (title, fn, ylabel, fmt_fn)) in zip(axes, titles):
+            for i, name in enumerate(PAPER_AGENTS):
+                vals = [fn(regime_data[r][name]) for r in regimes]
+                offset = (i - 1) * w
+                bars = ax.bar(x + offset, vals, w, color=colors[name],
+                              label=name, alpha=0.88, zorder=3)
+                for bar, v in zip(bars, vals):
+                    label = fmt_fn(v) if fmt_fn else f"{v:.0f}"
+                    ax.annotate(label,
+                                xy=(bar.get_x() + bar.get_width() / 2, v),
+                                xytext=(0, 3), textcoords="offset points",
+                                ha="center", va="bottom", color=fg,
+                                fontsize=7.5, fontweight="bold")
+            ax.set_xticks(x)
+            ax.set_xticklabels(regimes, fontsize=9)
+            ax.set_ylabel(ylabel)
+            ax.set_title(title, fontweight="bold")
+            leg = ax.legend(fontsize=8, loc="upper left")
+            style_fn(ax, leg)
+
+        # SLA line on latency panel
+        axes[1].axhline(CONFIG["max_latency_ms"], color="#CC0000",
+                        linewidth=1.2, linestyle=":", alpha=0.8,
+                        label=f"SLA ({CONFIG['max_latency_ms']} ms)")
+        axes[1].legend(fontsize=8, loc="upper left")
+
+        fig.savefig(path, dpi=150, bbox_inches="tight", facecolor=bg_fig)
+        plt.close(fig)
+    return path
+
+
+# ── Summary table ──────────────────────────────────────────────────────────────
+
+def print_table(data: dict):
+    W = 105
+    print("\n" + "=" * W)
+    print(f"{'Agent':<16}  {'Mean Reward':>12}  {'Std':>8}  "
+          f"{'P50':>8}  {'P95':>8}  {'P99':>8}  "
+          f"{'SLA Viol%':>10}  {'AvgBatch':>9}  {'Rwd/Disp':>9}")
+    print("-" * W)
+    for name in AGENTS + ["GreedyBatch"]:
+        d = data.get(name, {})
+        if not d: continue
+        mr  = np.mean(d["rewards"])
+        sr  = np.std(d["rewards"])
+        raw = d["latency_raw"]
+        p50 = float(np.percentile(raw, 50)) if raw else float("nan")
+        p95 = float(np.percentile(raw, 95)) if raw else float("nan")
+        p99 = float(np.percentile(raw, 99)) if raw else float("nan")
+        sla = np.mean(d["sla_viol_rates"]) * 100
+        ab  = np.mean(d["batch_sizes"]) if d["batch_sizes"] else float("nan")
+        rd  = np.mean(np.array(d["rewards"]) / np.maximum(d["n_dispatches"], 1))
+        print(f"{name:<16}  {mr:>+12.0f}  {sr:>8.0f}  "
+              f"{p50:>8.1f}  {p95:>8.1f}  {p99:>8.1f}  "
+              f"{sla:>9.2f}%  {ab:>9.1f}  {rd:>9.1f}")
     print("=" * W)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Evaluate trained PPO vs baselines"
-    )
-    parser.add_argument(
-        "--model",
-        default=DEFAULT_MODEL,
-        help=f"Path to SB3 model zip (default: {DEFAULT_MODEL})",
-    )
-    parser.add_argument(
-        "--skip-heatmap",
-        action="store_true",
-        help="Skip the decision heatmap generation (faster).",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ppo-model",    default=DEFAULT_PPO_MODEL)
+    parser.add_argument("--sac-model",    default=DEFAULT_SAC_MODEL)
+    parser.add_argument("--d3qn-model",   default=DEFAULT_D3QN_MODEL)
+    parser.add_argument("--ppo-vecnorm",  default=PPO_VECNORM)
+    parser.add_argument("--sac-vecnorm",  default=SAC_VECNORM)
+    parser.add_argument("--d3qn-vecnorm", default=D3QN_VECNORM)
+    parser.add_argument("--skip-heatmap", action="store_true")
+    parser.add_argument("--skip-regimes", action="store_true")
     args = parser.parse_args()
 
-    model_path = args.model
-    if not os.path.exists(model_path + ".zip") and not os.path.exists(model_path):
-        print(f"\n[ERROR] Model not found at: {model_path}")
-        print("  Run `python agent/train.py` first to train the PPO agent.")
+    ppo_ok  = os.path.exists(args.ppo_model + ".zip") or os.path.exists(args.ppo_model)
+    sac_ok  = os.path.exists(args.sac_model + ".pt")
+    d3qn_ok = os.path.exists(args.d3qn_model + ".pt")
+
+    if not ppo_ok:
+        print(f"[ERROR] PPO model not found: {args.ppo_model}")
+        print("  Run: python agent/train.py")
+        sys.exit(1)
+    if not sac_ok:
+        print(f"[ERROR] SAC model not found: {args.sac_model}")
+        print("  Run: python agent/train_sac.py")
+        sys.exit(1)
+    if not d3qn_ok:
+        print(f"[ERROR] D3QN model not found: {args.d3qn_model}")
+        print("  Run: python agent/train_d3qn.py")
         sys.exit(1)
 
-    print("=" * 60)
+    print("=" * 70)
     print("  Dynamic Request Batching — Evaluation")
-    print("=" * 60)
-    print(f"  Model path  : {model_path}")
-    print(f"  Episodes    : {N_EPISODES} per agent")
-    print(f"  Output plot : {PLOT_PATH}")
-    print("=" * 60 + "\n")
+    print("=" * 70)
+    print(f"  PPO model  : {args.ppo_model}")
+    print(f"  SAC model  : {args.sac_model}")
+    print(f"  D3QN model : {args.d3qn_model}")
+    print(f"  Episodes   : {N_EPISODES} per agent")
+    print("=" * 70 + "\n")
 
-    data = run_all_agents(model_path)
-    print_summary_table(data)
+    # ── Main comparison ───────────────────────────────────────────────────
+    data = run_all(args.ppo_model, args.ppo_vecnorm,
+                   args.sac_model, args.sac_vecnorm,
+                   args.d3qn_model, args.d3qn_vecnorm)
+    print_table(data)
 
-    path = generate_figure(data)
-    print(f"\n✓  Comparison figure saved → {path}")
+    for style in ("dark", "paper"):
+        p = generate_figure(data, style=style)
+        print(f"\n  Comparison ({style:5s})  → {p}")
 
+    # ── Decision heatmap ──────────────────────────────────────────────────
     if not args.skip_heatmap:
-        print("\n  Generating decision heatmap (querying policy on 50×50 grid)...",
-              end=" ", flush=True)
-        hmap_path = generate_decision_heatmap(model_path)
-        print(f"done.\n✓  Decision heatmap saved   → {hmap_path}")
+        for style in ("dark", "paper"):
+            print(f"  Heatmap ({style:5s})      …", end=" ", flush=True)
+            hp = generate_heatmap(args.ppo_model, args.ppo_vecnorm, style=style)
+            print(f"→ {hp}")
+
+    # ── Traffic regime robustness ─────────────────────────────────────────
+    if not args.skip_regimes:
+        print("\n  Traffic regimes …")
+        rd = run_regimes(args.ppo_model, args.ppo_vecnorm,
+                         args.sac_model, args.sac_vecnorm,
+                         args.d3qn_model, args.d3qn_vecnorm)
+        for style in ("dark", "paper"):
+            rp = generate_regime_plot(rd, style=style)
+            print(f"  Regimes ({style:5s})      → {rp}")
 
 
 if __name__ == "__main__":

@@ -1,153 +1,146 @@
 # config.py
-# Central configuration for the Dynamic Request Batching RL project
+# Central configuration for the Dynamic Request Batching RL project.
+#
+# Problem: An inference-serving node (e.g. GPU running a transformer model)
+# receives a continuous stream of requests. A batching layer decides every
+# decision_interval_ms whether to DISPATCH the queued requests now or WAIT
+# for the queue to grow (larger batches = better GPU utilisation).
+#
+# The SLA constraint: TOTAL latency (queue wait + GPU processing) must stay
+# under max_latency_ms for every request. The trade-off the agent must learn:
+#   too aggressive → many tiny batches → high dispatch overhead, bad efficiency
+#   too conservative → large batches → high latency, SLA violations
 
 CONFIG = {
-    # ── Environment ─────────────────────────────────────────────────────────
-    # Scaled to a realistic single GPU inference server node.
-    # At 2 000 req/s base rate with a 10 ms decision tick, ~20 requests
-    # arrive per tick on average (up to ~50 during peak hours).
-    # This creates real batching pressure — the agent cannot just flush every
-    # tick or it will pay the dispatch cost 100 times per second.
-    "max_batch_size": 500,       # Static fallback (or max bounds limit)
-    "dynamic_batching_enabled": True, # Enables capacity to scale with traffic
-    "min_batch_size": 10,        # Minimum functional batch limit
-    "max_possible_batch_size": 1000, # Absolute hardware capacity
-    "target_service_time_ms": 200, # Desired base accumulation window for scaling
-    "max_latency_ms": 500,       # SLA: oldest request must not exceed 500 ms
-    "arrival_rate": 2_000,       # Base Poisson rate (req/s) — realistic for one
-                                  # inference node serving a social media backend
-                                  # (Instagram: ~10k-100k QPS globally, ~2k per node)
-    "episode_ms": 60_000,        # 60 seconds of simulated time per episode
-    "decision_interval_ms": 10,  # Agent decides every 10 ms (100 Hz)
+    # ── Environment ───────────────────────────────────────────────────────────
+    "max_batch_size":          512,    # Hard cap on dispatch size (GPU memory)
+    "min_batch_size":          8,      # Below this batch size GPU is inefficient
+    "arrival_rate":            2_000,  # Base Poisson rate (req/s) — realistic for
+                                       # one inference node serving a social platform
+    "episode_ms":              60_000, # 60 s of simulated time per episode
+    "decision_interval_ms":    10,     # Agent decides at 100 Hz
 
-    # ── Reward shaping ───────────────────────────────────────────────────────
-    # alpha: reward per request served in a batch → encourages efficiency
-    # beta:  penalty per ms of oldest_wait → encourages low latency
-    # gamma: idle penalty when agent Waits with an empty queue
-    # serve_dispatch_cost: FIXED cost every time the agent hits Serve,
-    #   regardless of batch size. Represents GPU kernel launch overhead,
-    #   memory copy, network round-trip setup, etc.
-    #   This is the key parameter that makes the agent WANT to batch:
-    #     Serve(batch=1):  1.0 - latency - 3.0  ← likely negative (bad)
-    #     Serve(batch=5):  5.0 - latency - 3.0  ← break-even
-    #     Serve(batch=20): 20.0 - latency - 3.0 ← clearly positive (good)
-    "alpha": 1.0,
-    "beta":  0.002,              # Smaller beta now because wait_ms values will
-                                  # be larger at higher traffic — avoid dominating
-    "gamma": 0.5,                # Stronger idle penalty — empty queue should be rare
-    "serve_dispatch_cost": 3.0,  # Fixed overhead per Serve action.
-                                  # Forces agent to accumulate ~3+ requests before serving.
+    # ── SLA ──────────────────────────────────────────────────────────────────
+    # SLA is on TOTAL latency: time in queue + GPU processing time.
+    # This is what real production contracts specify (client-perceived latency).
+    "max_latency_ms":          500,    # P99 total latency budget (ms)
 
-    # ── SLA ─────────────────────────────────────────────────────────────────
-    "sla_penalty": -50.0,        # Harsher SLA violation penalty at scale
+    # ── GPU Processing Model ──────────────────────────────────────────────────
+    # Approximates a mid-size transformer on a single A10G/A100 GPU.
+    # processing_time(n) = gpu_base_ms + gpu_per_request_ms * n   (linear regime)
+    # Typical numbers from NVIDIA Triton benchmarks:
+    #   batch=1:   ~9 ms   (kernel launch dominates)
+    #   batch=32:  ~12 ms  (good utilisation)
+    #   batch=128: ~24 ms  (memory-bandwidth bound)
+    #   batch=256: ~40 ms  (saturation)
+    "gpu_base_ms":             8.0,    # Fixed overhead: kernel launch + DMA copy
+    "gpu_per_request_ms":      0.12,   # Marginal compute per request (linear fit)
 
-    # ── Traffic variation (time-of-day) ──────────────────────────────────────
-    "peak_hours": (9, 23),       # Extended peak window (morning scroll → late night)
-    "peak_multiplier": 2.5,      # 5 000 req/s at peak — GPU near saturation
-    "offpeak_multiplier": 0.2,   # 400 req/s at night — agent learns patience
+    # ── Traffic Variation (Time-of-Day) ──────────────────────────────────────
+    # The agent is trained across the full 24-h rate distribution. It must learn
+    # to be aggressive (serve quickly) at peak and patient (accumulate) off-peak.
+    "peak_hours":              (9, 23),  # Extended peak window
+    "peak_multiplier":         2.5,      # → 5 000 req/s at peak
+    "offpeak_multiplier":      0.2,      # → 400 req/s at night
+
+    # ── Reward Shaping ────────────────────────────────────────────────────────
+    # Business objective: maximise requests served, minimise latency violations.
+    #
+    # SERVE action reward:
+    #   r = alpha * batch_size
+    #     - beta  * oldest_wait_ms          ← urgency while accumulating
+    #     - dispatch_cost                   ← fixed GPU launch overhead
+    #     - sla_penalty_per_ms * Σ(violation_ms per request that breaches SLA)
+    #
+    # WAIT action reward:
+    #   r = -beta * oldest_wait_ms          ← growing impatience cost
+    #     - idle_penalty    (if queue empty) ← lost capacity
+    #
+    # Key tension: dispatch_cost forces the agent to batch ≥ 5 requests before
+    # serving is profitable. beta forces it not to sit on old requests too long.
+    "alpha":               1.0,     # Revenue per request served
+    "beta":                0.003,   # Per-ms urgency penalty while waiting / serving
+    "dispatch_cost":       5.0,     # Fixed cost per dispatch (~5 requests worth)
+    "idle_penalty":        0.5,     # Per-step penalty when queue is empty
+    "sla_penalty_per_ms":  0.3,     # Penalty per ms of total-latency SLA violation
+                                    # (per request). 100ms over SLA = -30 per request.
 }
 
-# ───────────────────────────────────────────────────────────────────────────
-# DQN Hyperparameters
-# Compare directly against PPO_KWARGS in agent/train.py
-# ───────────────────────────────────────────────────────────────────────────
-
-DQN_CONFIG = {
-    # Learning
-    "learning_rate": 1e-4,         # DQN is more sensitive to LR than PPO
-    "gamma": 0.99,                 # Discount factor — same as PPO for fair comparison
-    "batch_size": 64,              # Minibatch size for Q-network updates — same as PPO
-
-    # Replay buffer
-    "buffer_size": 100_000,        # How many past (s,a,r,s') transitions to store
-                                   # Key DQN innovation — breaks temporal correlations
-    "learning_starts": 10_000,     # Steps of random action BEFORE learning begins
-                                   # Fills the replay buffer with diverse data first
-
-    # Target network
-    "target_update_interval": 1000, # Every N steps, copy Q-network → Target Q-network
-                                    # Prevents the Q-value target from "chasing itself"
-                                    # (main stability trick of DQN vs vanilla Q-learning)
-    "tau": 1.0,                    # 1.0 = hard update (copy weights completely)
-                                   # <1.0 = soft/polyak update (blend weights gradually)
-
-    # Exploration (ε-greedy)
-    "exploration_fraction": 0.2,   # Fraction of training spent decaying ε
-    "exploration_initial_eps": 1.0, # Start fully random (100% explore)
-    "exploration_final_eps": 0.05,  # End at 5% random exploration
-
-    # Network
-    "net_arch": [64, 64],          # Same hidden layer size as PPO for fair comparison
-
-    # Training
-    "train_freq": 4,               # Train the Q-network every N environment steps
-    "gradient_steps": 1,           # Gradient update steps per training call
-
-    # Logging
-    "verbose": 1,
-    "tensorboard_log": "tensorboard_logs/",
+# ── SAC Hyperparameters ───────────────────────────────────────────────────────
+SAC_CONFIG = {
+    "learning_rate":          3e-4,
+    "buffer_size":            300_000,   # replay buffer capacity
+    "batch_size":             256,
+    "gamma":                  0.99,
+    "tau":                    0.005,     # soft target update coefficient
+    "learning_starts":        5_000,     # random policy warm-up steps
+    "train_freq":             1,         # gradient update every N env steps
+    "gradient_steps":         1,         # gradient updates per train_freq steps
+    "net_arch":               [128, 128],
+    "target_entropy_ratio":   0.5,       # H_target = log(n_actions) * ratio
+                                        # 0.5 ≈ 0.347 nats for binary — keeps
+                                        # policy at ~75/25 at the decision boundary
+    "reward_scale":           1e-3,     # scale stored rewards so Q-values ≈ 3–5
+                                        # α_max=1.0 → entropy = 0.347 = ~10% of Q
+                                        # keeps entropy regularisation numerically balanced
 }
 
-
-RPPO_CONFIG = {
-    "learning_rate": 3e-4,
-    "gamma": 0.99, 
-    "gae_lambda": 0.95,
-    "clip_range": 0.2,
-    "ent_coef": 0.01,
-    "vf_coef": 0.5,
-    "max_grad_norm": 0.5,
-
-    "lstm_hidden_size": 64,
-    "n_lstm_layers": 1,
-    "enable_critic_lstm":True,
-    "n_steps": 128,
-    "batch_size": 64,
-    "n_epochs":10,
-    "net_arch": dict(pi=[64], vf=[64]),
+# ── PPO Hyperparameters ────────────────────────────────────────────────────────
+PPO_CONFIG = {
+    "learning_rate":   3e-4,
+    "n_steps":         2048,    # Rollout steps per env before each gradient update
+    "batch_size":      256,     # Minibatch size (larger = more stable gradients)
+    "n_epochs":        10,      # Gradient epochs per rollout
+    "gamma":           0.99,    # Discount factor
+    "gae_lambda":      0.95,    # GAE lambda
+    "clip_range":      0.2,     # PPO clip parameter
+    "ent_coef":        0.005,   # Entropy bonus (small: prevent degenerate policy)
+    "vf_coef":         0.5,     # Value function loss weight
+    "max_grad_norm":   0.5,
+    "net_arch":        [128, 128],  # Policy and value network hidden layers
 }
 
-# ───────────────────────────────────────────────────────────────────────────
-# Experiment presets — change one key to explore different traffic regimes.
-#
-# Usage example:
-#   from config import EXPERIMENT_CONFIGS
-#   env = BatchingEnv(config=EXPERIMENT_CONFIGS["high_load"])
-# ───────────────────────────────────────────────────────────────────────────
+# ── D3QN Hyperparameters ──────────────────────────────────────────────────────
+# Dueling Double DQN + Prioritized Experience Replay + n-step returns.
+D3QN_CONFIG = {
+    "learning_rate":           3e-4,
+    "buffer_size":             500_000,  # larger than SAC: PER needs diversity
+    "batch_size":              256,
+    "gamma":                   0.99,
+    "tau":                     0.005,    # soft target update coefficient
+    "learning_starts":         5_000,    # random warm-up steps
+    "train_freq":              4,        # update every 4 env steps
+    "gradient_steps":          1,
+    "net_arch":                [128, 128],
+    "reward_scale":            1e-3,     # same scaling as SAC for Q-value stability
+    # ε-greedy exploration schedule
+    "exploration_initial_eps": 1.0,
+    "exploration_final_eps":   0.02,     # 2% noise at convergence
+    "exploration_fraction":    0.15,     # anneal over first 15% of timesteps
+    # Prioritized Experience Replay
+    "per_alpha":               0.6,      # prioritization exponent: 0=uniform, 1=full
+    "per_beta_start":          0.4,      # IS-weight correction start (low bias early)
+    "per_beta_end":            1.0,      # IS-weight correction end  (fully unbiased)
+    "per_eps":                 1e-6,     # min priority to prevent zero sampling
+    # n-step returns
+    "n_step":                  3,        # 3-step: covers the wait→accumulate→serve cycle
+}
 
+# ── Training Settings ──────────────────────────────────────────────────────────
+TRAIN_CONFIG = {
+    "total_timesteps":   1_000_000,  # 1M steps for strong convergence
+    "n_envs":            4,          # Parallel environments
+    "eval_freq":         20_000,     # Steps between evaluations
+    "checkpoint_freq":   100_000,    # Steps between model checkpoints
+    "n_eval_episodes":   10,
+}
+
+# ── Experiment Presets ─────────────────────────────────────────────────────────
+# Vary traffic regime to evaluate policy robustness. The agent is trained on
+# "standard" (with full time-of-day variation). These presets are eval-only.
 EXPERIMENT_CONFIGS = {
-    # ── Off-peak night traffic (e.g. 2 AM social media) ─────────────────────
-    # ~400 req/s — very sparse. ~4 requests arrive per 10 ms tick.
-    # Agent should accumulate longer to fill batches efficiently.
-    "off_peak": {
-        **CONFIG,
-        "arrival_rate": 400,
-        "peak_multiplier": 1.5,
-    },
-
-    # ── Standard daytime load ────────────────────────────────────────────────
-    # 2 000 req/s — default CONFIG. ~20 requests per tick.
-    # This is the primary training regime.
-    "standard": CONFIG,
-
-    # ── Peak hour stress test (e.g. Instagram at 7 PM) ───────────────────────
-    # 5 000 req/s — GPU is under pressure. ~50 requests per tick.
-    # Agent must balance batch efficiency vs SLA violations.
-    "peak_load": {
-        **CONFIG,
-        "arrival_rate": 5_000,
-        "peak_multiplier": 3.0,       # up to 15 000 req/s burst
-        "sla_penalty": -100.0,        # harsher SLA at high load
-    },
-
-    # ── Viral event / traffic spike (e.g. Super Bowl moment) ─────────────────
-    # 20 000 req/s — extreme backpressure test. Queue fills in milliseconds.
-    # Agent must serve aggressively to avoid SLA violations.
-    "viral_spike": {
-        **CONFIG,
-        "arrival_rate": 20_000,
-        "max_batch_size": 1_000,      # GPU can handle larger batches
-        "peak_multiplier": 4.0,
-        "sla_penalty": -200.0,
-    },
+    "off_peak":   {**CONFIG, "arrival_rate": 400,    "peak_multiplier": 1.5},
+    "standard":   CONFIG,
+    "peak_load":  {**CONFIG, "arrival_rate": 5_000,  "peak_multiplier": 3.0},
+    "viral_spike":{**CONFIG, "arrival_rate": 20_000, "max_batch_size":  1024},
 }
