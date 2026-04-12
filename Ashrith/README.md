@@ -1,8 +1,8 @@
-# Policy-Based RL Agents for Request Batching
+# RL Agents for Request Batching
   
-> **Part:** Model-Free RL — Policy Gradient, Actor-Critic, and PPO
+> **Part:** Policy Gradient, Actor-Critic, PPO, and Forecast-Aware Accelerated RL
 
-This folder implements three policy-based reinforcement learning agents for the **dynamic request batching** problem. The RL agent learns *when* to serve accumulated requests (WAIT vs SKIP) to maximize batching efficiency while minimizing client-side latency.
+This folder implements several reinforcement learning agents for the **dynamic request batching** problem. The agent learns *when* to serve accumulated requests (`WAIT` vs `SKIP`) to maximize batching efficiency while minimizing client-side latency.
 
 ---
 
@@ -13,6 +13,27 @@ This folder implements three policy-based reinforcement learning agents for the 
 | **REINFORCE** | Policy Gradient | Collects full episodes, computes Monte Carlo returns, uses a learned value baseline for variance reduction |
 | **A2C** | Advantage Actor-Critic | Shared actor-critic network with N-step TD updates; lower variance than REINFORCE via bootstrapping |
 | **PPO** | Proximal Policy Optimization | Clipped surrogate objective + GAE (Generalized Advantage Estimation); multi-epoch mini-batch updates for best sample efficiency |
+| **Predictive Dyna-Q** | Forecast-aware accelerated RL | Uses grouped arrival-rate prediction, discretized Q-learning, and model-based planning updates to react faster under changing traffic |
+
+## Why Add Predictive Dyna-Q?
+
+This repo now includes a fourth path that is deliberately **different** from the teammate methods you listed:
+
+- not `SAC + LSTM + PER`
+- not `IMPALA`
+- not `NN + PPO`
+- not `PPO / DQN / SAC`
+
+The design is inspired by the paper:
+
+- **Using Grouped Linear Prediction and Accelerated Reinforcement Learning for Online Content Caching**
+
+It is not a literal cache-replacement reproduction, because this environment is about **request batching**, not content eviction. Instead, it adapts the paper's two transferable ideas:
+
+- **Grouped linear prediction** of near-future demand
+- **Accelerated RL** via simulated/planning updates from a learned one-step model
+
+That makes it a strong "same project, new method" option.
 
 ### Why Policy-Based Methods?
 
@@ -28,22 +49,17 @@ From the project notes:
 
 ```
 Ashrith/
-├── networks.py            # Neural network architectures
-│   ├── PolicyNetwork        → state → action probabilities (Softmax)
-│   ├── ValueNetwork         → state → V(s) scalar value
-│   └── ActorCriticNetwork   → shared trunk with actor + critic heads
-│
-├── reinforce_agent.py     # REINFORCE with learned baseline
-├── a2c_agent.py           # Advantage Actor-Critic (N-step)
-├── ppo_agent.py           # PPO with GAE + clipped objective
-│
-├── train_agents.py        # Unified training script
-├── compare_all.py         # Evaluation & comparison plots
-├── run_all.py             # Master runner (train + compare + plot)
-│
-├── checkpoints/           # Saved model weights (.pth)
-├── logs/                  # Training logs (JSON)
-└── results/               # Comparison & training curve plots
+├── predictive_dynaq_agent.py   # Main grouped prediction + Dyna-Q planning agent
+├── live_simulation.py          # Live dashboard for final demo
+├── compare_all.py              # Final multi-seed evaluation table
+├── train_agents.py             # Unified training script
+├── run_all.py                  # One-command experiment runner
+├── env/                        # Environment + traffic model
+├── baselines/                  # Rule-based baselines
+├── legacy/                     # Older REINFORCE/A2C/PPO code kept for comparison
+├── checkpoints/                # Main model artifacts
+├── logs/                       # Main training logs
+└── results/                    # Final evaluation outputs
 ```
 
 ---
@@ -53,13 +69,14 @@ Ashrith/
 ```bash
 # From the project root directory:
 
-# Train all 3 agents, evaluate, and generate comparison plots
+# Train all 4 agents, evaluate, and generate comparison plots
 python3 -m Ashrith.run_all
 
 # Train a specific agent
 python3 -m Ashrith.train_agents --agent reinforce --episodes 300
 python3 -m Ashrith.train_agents --agent a2c --episodes 300
 python3 -m Ashrith.train_agents --agent ppo --episodes 300
+python3 -m Ashrith.train_agents --agent predictive_dynaq --episodes 300
 
 # Run comparison only (requires trained checkpoints)
 python3 -m Ashrith.compare_all
@@ -67,38 +84,27 @@ python3 -m Ashrith.compare_all
 
 ---
 
-## Training Results
+## Paper Fit Notes
 
-All agents trained for **300 episodes** on Poisson traffic (λ=5.0 req/s):
+Of the paper directions discussed, the best fit for this environment is:
 
-| Agent | Best Reward | Final Avg (last 50) | Training Time |
-|-------|-------------|---------------------|---------------|
-| REINFORCE | -7.75 | -9.44 | ~2 min |
-| A2C | -1.44 | -4.72 | ~3 min |
-| **PPO** | **-0.78** | **-2.33** | ~1 min |
+- **Grouped Linear Prediction + Accelerated RL**
+
+The other two papers focus on richer cache-management settings with cache contents, hits/misses, replacement decisions, or batch-level cache admission. Those ideas are interesting, but they do not map as cleanly onto this repo's current `WAIT` vs `SKIP` batching environment without redesigning the problem itself.
 
 ---
 
-## Evaluation Comparison
+## Predictive Dyna-Q Overview
 
-Evaluated over 20 episodes against DQN and baseline policies:
+At each step, the agent:
 
-| Agent | Mean Reward | Batch Size | Wait Time |
-|-------|-------------|------------|-----------|
-| **A2C** | **-1.76 ± 0.58** | 1.8 | 0.172s |
-| **PPO** | -1.82 ± 0.38 | 1.8 | 0.171s |
-| DQN (existing) | -1.81 ± 0.55 | 1.8 | 0.172s |
-| REINFORCE | -8.49 ± 1.08 | 2.7 | 0.278s |
-| Random | -16.64 | 2.4 | 0.327s |
-| Fixed Wait | -20.86 | 6.5 | 0.684s |
-| Fixed Batch | -31.84 | 11.0 | 1.128s |
+1. observes the current batching state
+2. predicts the next arrival-rate feature from grouped recent history
+3. augments the state with that forecast
+4. updates a Q-table on the real transition
+5. performs extra planning updates from its learned transition model
 
-### Key Takeaways
-
-- **A2C, PPO, and DQN** all converge to similar top-tier performance
-- **PPO** has the **lowest variance** (±0.38) → most stable/reliable policy
-- **REINFORCE** is weaker due to high variance Monte Carlo estimates, but still **2× better** than the Random baseline
-- All RL agents **massively outperform** rule-based baselines (10–30× better reward)
+This gives a simple, fast, paper-inspired baseline that is easier to explain than a deep recurrent architecture.
 
 ---
 
@@ -142,7 +148,7 @@ for each rollout of T steps:
 
 ## Environment Interface
 
-The agents interact with `BatchingEnv` from `env/`:
+The agents interact with `BatchingEnv` from `Ashrith/env/`:
 
 - **State** (6-dim, normalized [0,1]): `[batch_size, wait_time, queue_length, time_since_last_skip, arrival_rate, system_load]`
 - **Action**: `0 = WAIT` (keep accumulating), `1 = SKIP` (send batch now)

@@ -1,15 +1,8 @@
 """
-Master Runner — Train All Agents & Generate Comparisons
+Master Runner for Ashrith's request batching experiments.
 
-Runs everything with one command:
-    python -m Ashrith.run_all
-
-This will:
-1. Train REINFORCE for 300 episodes
-2. Train A2C for 300 episodes
-3. Train PPO for 300 episodes
-4. Evaluate all agents + DQN + baselines
-5. Generate comparison plots & training curves
+Runs legacy baselines plus the main Predictive Dyna-Q agent and then
+builds the final evaluation table.
 """
 
 import os
@@ -18,7 +11,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from Ashrith.train_agents import train
-from Ashrith.compare_all import compare_all, plot_comparison, plot_training_curves
+from Ashrith.compare_all import compare_all
 
 
 def main():
@@ -28,7 +21,7 @@ def main():
     
     print("\n" + "█"*60)
     print("  ASHRITH's RL IMPLEMENTATIONS")
-    print("  Policy Gradient | Actor-Critic | PPO")
+    print("  Predictive Dyna-Q + Legacy Baselines")
     print("  Request Batching Environment")
     print("█"*60)
     
@@ -39,7 +32,7 @@ def main():
     
     agents = {}
     
-    for agent_type in ['reinforce', 'a2c', 'ppo']:
+    for agent_type in ['reinforce', 'a2c', 'ppo', 'predictive_dynaq']:
         print(f"\n{'─'*40}")
         print(f"  Training {agent_type.upper()}...")
         print(f"{'─'*40}")
@@ -56,32 +49,17 @@ def main():
     print("  PHASE 2: COMPARING ALL AGENTS")
     print("━"*60)
     
-    results = compare_all(
-        traffic_pattern=TRAFFIC,
-        num_eval_episodes=20,
-        seed=SEED
-    )
-    
-    # ── Phase 3: Generate Plots ──
-    print("\n\n" + "━"*60)
-    print("  PHASE 3: GENERATING PLOTS")
-    print("━"*60)
-    
-    os.makedirs(os.path.join('Ashrith', 'results'), exist_ok=True)
-    
-    if results:
-        plot_comparison(results, os.path.join('Ashrith', 'results', 'comparison.png'))
-    
-    plot_training_curves(os.path.join('Ashrith', 'results', 'training_curves.png'))
+    results = compare_all()
     
     # ── Summary ──
     print("\n\n" + "█"*60)
     print("  ALL DONE!")
     print("█"*60)
     print("\n  Generated files:")
-    print("  ├── Ashrith/checkpoints/   (trained models)")
-    print("  ├── Ashrith/logs/          (training logs)")
-    print("  └── Ashrith/results/       (comparison plots)")
+    print("  ├── Ashrith/checkpoints/   (main model artifacts)")
+    print("  ├── Ashrith/logs/          (main training logs)")
+    print("  ├── Ashrith/legacy/        (older baseline agents/artifacts)")
+    print("  └── Ashrith/results/       (final evaluation outputs)")
     print()
     
     # Print quick ranking

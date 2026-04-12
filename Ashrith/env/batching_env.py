@@ -103,6 +103,9 @@ class BatchingEnv(gym.Env):
         self.total_requests_processed = 0
         self.total_batches_sent = 0
         self.total_wait_time = 0
+        self.all_wait_times = []
+        self.queue_length_sum = 0
+        self.queue_length_samples = 0
         
         # Arrival rate tracking (exponential moving average)
         self.arrival_rate_ema = self.traffic_gen.base_rate
@@ -161,6 +164,10 @@ class BatchingEnv(gym.Env):
         # Update system load (simple simulation)
         self.system_load = min(1.0, len(self.wait_queue) / self.max_queue_length)
         
+        # Track queue metrics
+        self.queue_length_sum += len(self.wait_queue)
+        self.queue_length_samples += 1
+        
         info = {
             'batch_size': len(self.current_batch),
             'queue_length': len(self.wait_queue),
@@ -196,7 +203,9 @@ class BatchingEnv(gym.Env):
             return -0.1
         
         batch_size = len(self.current_batch)
-        avg_wait_time = np.mean([self.current_time - t for t in self.current_batch])
+        wait_times = [self.current_time - t for t in self.current_batch]
+        self.all_wait_times.extend(wait_times)
+        avg_wait_time = np.mean(wait_times)
         
         # Batch efficiency reward (normalized)
         batch_reward = self.alpha * (batch_size / self.max_batch_size)
@@ -276,10 +285,18 @@ class BatchingEnv(gym.Env):
         avg_wait_time = (self.total_wait_time / self.total_requests_processed
                         if self.total_requests_processed > 0 else 0)
         
+        p95_wait = np.percentile(self.all_wait_times, 95) if self.all_wait_times else 0.0
+        slo_violations = sum(1 for w in self.all_wait_times if w > 1.0)
+        slo_violation_rate = (slo_violations / len(self.all_wait_times) * 100.0) if self.all_wait_times else 0.0
+        avg_queue_length = self.queue_length_sum / max(1, self.queue_length_samples)
+        
         return {
             'total_requests': self.total_requests_processed,
             'total_batches': self.total_batches_sent,
             'avg_batch_size': avg_batch_size,
             'avg_wait_time': avg_wait_time,
+            'p95_wait_time': p95_wait,
+            'slo_violation_rate': slo_violation_rate,
+            'avg_queue_length': avg_queue_length,
             'throughput': self.total_requests_processed / (self.current_time + 1e-6)
         }
