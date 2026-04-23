@@ -6,7 +6,68 @@ This folder implements several reinforcement learning agents for the **dynamic r
 
 ---
 
-## Agents Implemented
+## API Endpoints
+
+Run the API:
+
+```bash
+python3 -m Ashrith.api_dynaq
+```
+
+Available endpoints:
+
+- `GET /health`
+- `POST /infer`
+
+Sample request:
+
+```bash
+curl -X POST http://127.0.0.1:8080/infer \
+  -H "Content-Type: application/json" \
+  -d '{"state":[0.1,0.1,0.1,0.1,0.2,0.3]}'
+```
+
+Sample response:
+
+```json
+{
+  "action": 0,
+  "action_name": "WAIT",
+  "model": "predictive_dynaq_best.npy"
+}
+```
+
+---
+
+## How to Run
+
+```bash
+# From the project root directory:
+
+# Train all agents and run evaluation
+python3 -m Ashrith.run_all
+
+# Train a specific agent
+python3 -m Ashrith.train_agents --agent reinforce --episodes 300
+python3 -m Ashrith.train_agents --agent a2c --episodes 300
+python3 -m Ashrith.train_agents --agent ppo --episodes 300
+python3 -m Ashrith.train_agents --agent predictive_dynaq --episodes 300
+
+# Run comparison only
+python3 -m Ashrith.compare_all
+
+# Run live simulation dashboard
+python3 -m Ashrith.live_simulation
+
+# Run inference API for reverse proxy
+python3 -m Ashrith.api_dynaq
+```
+
+---
+
+## Project Information
+
+### Agents Implemented
 
 | Agent | Method | Key Idea |
 |-------|--------|----------|
@@ -14,17 +75,6 @@ This folder implements several reinforcement learning agents for the **dynamic r
 | **A2C** | Advantage Actor-Critic | Shared actor-critic network with N-step TD updates; lower variance than REINFORCE via bootstrapping |
 | **PPO** | Proximal Policy Optimization | Clipped surrogate objective + GAE (Generalized Advantage Estimation); multi-epoch mini-batch updates for best sample efficiency |
 | **Predictive Dyna-Q** | Forecast-aware accelerated RL | Uses grouped arrival-rate prediction, discretized Q-learning, and model-based planning updates to react faster under changing traffic |
-
-## Why Add Predictive Dyna-Q?
-
-This repo now includes a fourth path that is deliberately **different** from the teammate methods you listed:
-
-- not `SAC + LSTM + PER`
-- not `IMPALA`
-- not `NN + PPO`
-- not `PPO / DQN / SAC`
-
-The design is inspired by the paper:
 
 - **Using Grouped Linear Prediction and Accelerated Reinforcement Learning for Online Content Caching**
 
@@ -60,29 +110,6 @@ Ashrith/
 ├── checkpoints/                # Main model artifacts
 ├── logs/                       # Main training logs
 └── results/                    # Final evaluation outputs
-```
-
----
-
-## How to Run
-
-```bash
-# From the project root directory:
-
-# Train all 4 agents, evaluate, and generate comparison plots
-python3 -m Ashrith.run_all
-
-# Train a specific agent
-python3 -m Ashrith.train_agents --agent reinforce --episodes 300
-python3 -m Ashrith.train_agents --agent a2c --episodes 300
-python3 -m Ashrith.train_agents --agent ppo --episodes 300
-python3 -m Ashrith.train_agents --agent predictive_dynaq --episodes 300
-
-# Run comparison only (requires trained checkpoints)
-python3 -m Ashrith.compare_all
-
-# Run inference API for reverse proxy
-python3 -m Ashrith.api_dynaq
 ```
 
 ---
