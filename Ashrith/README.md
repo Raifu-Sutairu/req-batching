@@ -80,6 +80,9 @@ python3 -m Ashrith.train_agents --agent predictive_dynaq --episodes 300
 
 # Run comparison only (requires trained checkpoints)
 python3 -m Ashrith.compare_all
+
+# Run inference API for reverse proxy
+python3 -m Ashrith.api_dynaq
 ```
 
 ---
