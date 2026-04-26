@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::state::AppState;
-use crate::batch::{BatchSlot, BatchState};
+use crate::batch::{BatchSlot, BatchState, BatchKey};
 use crate::config::Config;
 use crate::router;
 
@@ -29,12 +29,12 @@ pub async fn handle_request(
                 }))
             });
 
-            //need to detect the first request to start the timer
-            let is_first = {
+            //need to detect the first request to start the timer and the batch size
+            let (is_first, should_serve_now) = {
                 let mut slot = entry.lock().unwrap();
                 slot.senders.push(tx);
 
-                slot.senders.len() == 1
+                (slot.senders.len() == 1, slot.senders.len() >= config.max_batch_size)
             };
 
             //if is_first is TRUE -> spawn a new task!
@@ -49,44 +49,57 @@ pub async fn handle_request(
                     //sleep for max wait time
                     tokio::time::sleep(std::time::Duration::from_millis(config_batch_timeout)).await;
 
-                    //wake up, lock the slot
-                    let mut locked = batch_slot_clone.lock().unwrap();
-
-                    match locked.state{
-                        BatchState::Waiting => {
-                            locked.state = BatchState::Serving;
-
-                            //remove the map entry so no new reqs can join this batch
-                            state_batch_map_clone.remove(&batch_key_clone);
-
-                            //steal the array of senders out of the lock safely
-                            let senders = std::mem::take(&mut locked.senders);
-
-                            //we no longer need the lock, so manually drop it to free it up early
-                            drop(locked);
-
-                            //loop through all the waiting clients and send them the response!
-                            for tx in senders {
-                                let response = hyper::Response::builder().status(200).body("Mock batched response from the Timer!".to_string()).unwrap();
-
-                                //we use _, bcoz if client disconnected while waiting, tx will return err. We dont care if they disconn - so ignore err!
-                                let _ = tx.send(response);
-                            }
-
-                            println!("Timer expired! Forcing the batch to serve");
-                        },
-                        BatchState::Serving => {
-                            //RL agent wouldve served this batch
-                            //quitely exit
-                        }
-                    }
+                    //helper function call
+                    serve_batch(batch_slot_clone, &batch_key_clone, &state_batch_map_clone, "Timer expired");
                 });
             }
 
-            // entry.lock().unwrap();
+            if should_serve_now {
+                serve_batch(entry.value().clone(), &key, &state.batch_map, "Size limit reached");
+            }
 
             let response = rx.await.unwrap();
             Ok(response)
         },
+    }
+}
+
+//helper funcs
+fn serve_batch(
+    batch_slot: Arc<std::sync::Mutex<BatchSlot>>,
+    batch_key: &BatchKey,
+    batch_map: &dashmap::DashMap<BatchKey, Arc<std::sync::Mutex<BatchSlot>>>,
+    reason: &str, 
+) {
+    //wake up, lock the slot
+    let mut locked = batch_slot.lock().unwrap();
+
+    match locked.state{
+        BatchState::Waiting => {
+            locked.state = BatchState::Serving;
+
+            //remove the map entry so no new reqs can join this batch
+            batch_map.remove(&batch_key);
+
+            //steal the array of senders out of the lock safely
+            let senders = std::mem::take(&mut locked.senders);
+
+            //we no longer need the lock, so manually drop it to free it up early
+            drop(locked);
+
+            //loop through all the waiting clients and send them the response!
+            for tx in senders {
+                let response = hyper::Response::builder().status(200).body("Mock batched response from the Timer!".to_string()).unwrap();
+
+                //we use _, bcoz if client disconnected while waiting, tx will return err. We dont care if they disconn - so ignore err!
+                let _ = tx.send(response);
+            }
+
+            println!("Forcing the batch to serve due to {}", reason);
+        },
+        BatchState::Serving => {
+            //RL agent wouldve served this batch
+            //quitely exit
+        }
     }
 }
