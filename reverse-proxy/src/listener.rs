@@ -79,8 +79,14 @@ pub async fn run(
             //wrap tokio's tcpstream in hyper's IO trait
             let io = hyper_util::rt::TokioIo::new(stream);
 
+            //clone the Arcs again to move them into closure
+            let state_for_req = state_clone.clone();
+            let config_for_req = config_clone.clone();
+
             //create our own custom http service
-            let service = crate::service::ProxyService::new(state_clone, config_clone);
+            let service = hyper::service::service_fn(move |req| {
+                crate::service::handle_request(req, state_for_req.clone(), config_for_req.clone())
+            });
 
             //bind connection to hyper's HTTP/1 server
             let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, service);
@@ -110,6 +116,6 @@ pub async fn run(
             }
         });
     }
-    
+
     Ok(())
 }

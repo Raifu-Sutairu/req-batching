@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-hyper-util = "0.1.20"
-tokio = "1.52.1"
+hyper = { version = "1.9.0", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["full"] }
+tokio = { version = "1.52.1", features = ["full"] }
+tracing = "0.1.44"
