@@ -5,6 +5,7 @@ mod config;
 mod state;
 mod service;
 mod batch;
+mod router;
 
 #[tokio::main]
 async fn main(){
