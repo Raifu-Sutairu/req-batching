@@ -12,7 +12,8 @@ async fn main(){
     //dummy config struct
     let dummy_config = Arc::new(config::Config {
         listen_addr: "127.0.0.1:8080".parse().unwrap(),
-        max_connections: 10
+        max_connections: 10,
+        batch_timeout_ms: 100,
     });
 
     //dummy state struct
