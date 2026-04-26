@@ -4,6 +4,7 @@ mod listener;
 mod config;
 mod state;
 mod service;
+mod batch;
 
 #[tokio::main]
 async fn main(){
@@ -14,11 +15,13 @@ async fn main(){
     });
 
     //dummy state struct
-    let dummy_state = Arc::new(state::AppState {});
+    // let dummy_state = Arc::new(state::AppState {
+    //     batch_map: 
+    // });
 
-    //shutdown channel
-    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+    // //shutdown channel
+    // let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
-    //call listener's run()
-    listener::run(dummy_state, dummy_config, shutdown_rx).await.unwrap();
+    // //call listener's run()
+    // listener::run(dummy_state, dummy_config, shutdown_rx).await.unwrap();
 }

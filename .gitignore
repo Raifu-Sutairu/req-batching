@@ -1,0 +1,10 @@
+#Os stuff
+.DS_Store
+
+#Env vars
+.env
+.env*
+
+# Rust
+/reverse-proxy/target/
+**/*.rs.bk
