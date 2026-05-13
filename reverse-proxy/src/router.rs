@@ -6,7 +6,7 @@ pub enum RoutingDecision{
 }
 
 pub fn route(req: &hyper::Request<hyper::body::Incoming>) -> RoutingDecision{
-    //for now we only batch GET requests
+    //for now we only batch get requests
     match req.method() {
         &hyper::Method::GET => {
             let batch_key = batch::BatchKey{

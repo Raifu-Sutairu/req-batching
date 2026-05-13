@@ -48,7 +48,7 @@ pub async fn run(
                         //drop the permit here so that its returned to the pool
                         drop(permit);
 
-                        //backoff briefly to avoid full usage of CPU
+                        //backoff briefly to avoid full usage of cpu
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         continue;
                     }
@@ -64,7 +64,7 @@ pub async fn run(
         info!("Accepted connection from {}", remote_addr);
 
         //spawning task and wiring hyper
-        //clone the Arcs so that we can move them to the next task
+        //clone the arcs so that we can move them to the next task
         let state_clone = state.clone();
         let config_clone = config.clone();
 
@@ -76,10 +76,10 @@ pub async fn run(
             //move the permit to this task (when task ends, permit is dropped)
             let _permit = permit;
             
-            //wrap tokio's tcpstream in hyper's IO trait
+            //wrap tokio's tcpstream in hyper's io trait
             let io = hyper_util::rt::TokioIo::new(stream);
 
-            //clone the Arcs again to move them into closure
+            //clone the arcs again to move them into closure
             let state_for_req = state_clone.clone();
             let config_for_req = config_clone.clone();
 
@@ -88,7 +88,7 @@ pub async fn run(
                 crate::service::handle_request(req, state_for_req.clone(), config_for_req.clone())
             });
 
-            //bind connection to hyper's HTTP/1 server
+            //bind connection to hyper's http/1 server
             let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, service);
 
             //we pin the connection future because select! requires it

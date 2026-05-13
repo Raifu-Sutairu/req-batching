@@ -40,95 +40,6 @@ A fixed timer always waits the full window even for sparse traffic. A fixed size
 
 The request lifecycle follows: TCP accept -> router (GET vs non-GET) -> BatchSlot park -> flush trigger -> fan-out. The safety envelope uses a hard size-cap and hard timeout that fire unconditionally before the agent is consulted. A Redis cache deduplication layer ensures identical responses are cleanly deduplicated in-flight.
 
-```mermaid
-flowchart TD
-    A[Incoming TCP Connection] --> B[listener.rs\nSemaphore-gated accept loop\nGraceful shutdown watch]
-    B --> C[service.rs\nHyper HTTP/1 handler\nArc AppState per task]
-    C --> D{router.rs\nBatchKey fingerprint\nmethod + path hash}
-    D -->|GET| E[state.rs\nDashMap batch registry\nentry or_insert_with atomic]
-    D -->|non-GET| F[PassThrough\nForward immediately]
-    E --> G[batch.rs - BatchSlot\noneshot Sender parked\ncreated_at timestamp]
-    G --> H{Flush trigger}
-    H -->|timer fires| I[serve_batch\nWaiting to Serving\nidempotent state guard]
-    H -->|size cap reached| I
-    H -->|RL agent SERVE| I
-    I --> J[mem take senders\nRemove slot from map\nFan out response to N clients]
-    J --> K[Client]
-    F --> K
-```
-
-```mermaid
-graph LR
-    main["main.rs\nwires config + state + listener"]
-    config["config.rs\nSocketAddr, timeouts, limits"]
-    state["state.rs\nAppState\nDashMap batch registry"]
-    listener["listener.rs\nTCP accept loop\nSemaphore + shutdown watch"]
-    service["service.rs\nHyper service_fn\nbatching engine"]
-    router["router.rs\nRoutingDecision\nBatch or PassThrough"]
-    batch["batch.rs\nBatchKey BatchState BatchSlot\noneshot channel types"]
-
-    main --> config
-    main --> state
-    main --> listener
-    listener --> service
-    service --> router
-    service --> state
-    service --> batch
-    router --> batch
-    state --> batch
-```
-
-```mermaid
-stateDiagram-v2
-    [*] --> Waiting : first request pushes Sender\ntimer task spawned
-    Waiting --> Serving : serve_batch acquires lock\natomic state transition
-    Serving --> [*] : slot removed from DashMap\nsenders drained via mem take\nresponse fanned out
-    Waiting --> Serving : size cap reached inline\nsame idempotent guard
-    Waiting --> Serving : RL agent returns SERVE\ngRPC call with timeout fallback
-```
-
-```mermaid
-flowchart TD
-    internet[Internet] --> lb
-
-    subgraph edge ["Edge Layer"]
-        lb["Load Balancer\nTLS termination\nRate limiting"]
-    end
-
-    lb --> proxy1
-    lb --> proxy2
-
-    subgraph proxy_cluster ["Proxy Cluster"]
-        proxy1["req-batching instance 1\n:8080"]
-        proxy2["req-batching instance 2\n:8081"]
-    end
-
-    proxy1 --> upstream
-    proxy2 --> upstream
-
-    subgraph data ["Data Plane"]
-        cache["Response cache\nIn-flight dedup\nTTL expiry"]
-        telemetry["Event stream\nBatch telemetry\nRL replay buffer"]
-    end
-
-    proxy1 --> cache
-    proxy2 --> cache
-    proxy1 --> telemetry
-    proxy2 --> telemetry
-
-    subgraph rl ["RL System"]
-        agent["PPO Agent\nWAIT or SERVE"]
-        env["Gymnasium Env\nReward signal\nState vector"]
-    end
-
-    telemetry --> env
-    env --> agent
-    agent --> proxy1
-    agent --> proxy2
-
-    upstream["Upstream Service\nany HTTP/1.1 server"]
-```
-
 ### 5b. MDP Formulation
 
 ![MDP Plot](docs/MDP_Plot.png)
@@ -255,6 +166,14 @@ let config = Arc::new(config::Config {
 | `batch_timeout_ms` | Maximum time a batch is held open |
 | `max_batch_size` | Maximum requests per batch before early flush |
 
-## 11. License
+## 11. Authors
+
+1. R Abinav (ME23B1004) - Code, contribution present on [`main` branch](https://github.com/Raifu-Sutairu/req-batching/tree/main)
+2. Sudarshan S (CS23B2007) - Code, contribution present on [`sudarshan` branch](https://github.com/Raifu-Sutairu/req-batching/tree/sudarshan)
+3. Chris Jason (CS23B1012) - Code, contribution present on [`cjayy` branch](https://github.com/Raifu-Sutairu/req-batching/tree/cjayy)
+4. Shirish Giroti (CS23B2041) - Code, contribution present on [`feature/sac-lstm-per` branch](https://github.com/Raifu-Sutairu/req-batching/tree/feature/sac-lstm-per)
+5. Ashrith Yathin (CS23B2006) - Code, contribution present on [`ashrith` branch](https://github.com/Raifu-Sutairu/req-batching/tree/ashrith)
+
+## 12. License
 
 This project is licensed under the MIT License. See [LICENSE](./LICENSE) for the full text.

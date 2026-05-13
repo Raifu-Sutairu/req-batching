@@ -59,7 +59,7 @@ pub async fn handle_request(
             
             *req.uri_mut() = uri;
             
-            //req is currently Request<Incoming>. We need to convert it to Request<Full<Bytes>> to pass to http_client
+            //req is currently request<incoming>. we need to convert it to request<full<bytes>> to pass to http_client
             let (parts, body) = req.into_parts();
             let body_bytes = match body.collect().await {
                 Ok(c) => c.to_bytes(),
@@ -102,7 +102,7 @@ pub async fn handle_request(
                     }))
                 });
                 entry.value().clone()
-            }; //entry is dropped here, releasing the DashMap shard lock!
+            }; //entry is dropped here, releasing the dashmap shard lock!
 
             let (is_first, batch_size, batch_age_ms) = {
                 let mut slot = slot_arc.lock().unwrap();
@@ -121,18 +121,18 @@ pub async fn handle_request(
                 });
             }
 
-            // Determine if we should flush
+            //determine if we should flush
             let mut reason = None;
             
-            // HARD LIMIT 1: size cap
+            //hard limit 1: size cap
             if batch_size >= config.max_batch_size {
                 reason = Some(FlushReason::SizeCap);
             } 
-            // HARD LIMIT 2: timeout cap
+            //hard limit 2: timeout cap
             else if batch_age_ms >= config.batch_timeout_ms as f32 {
                 reason = Some(FlushReason::Timeout);
             } 
-            // SOFT DECISION: Ask RL agent
+            //soft decision: ask rl agent
             else {
                 let p99 = state.latency_tracker.lock().unwrap().p99() as f32;
                 let rate = state.rate_counter.lock().unwrap().rate_per_sec() as f32;
@@ -163,7 +163,7 @@ pub async fn handle_request(
                         },
                         Ok(Err(e)) => {
                             tracing::warn!("RL Agent gRPC error: {}. Falling back to heuristics.", e);
-                            // We don't flush immediately, we let heuristics take over when limits are reached
+                            //we don't flush immediately, we let heuristics take over when limits are reached
                         },
                         Err(_) => {
                             tracing::warn!("RL Agent timeout. Falling back to heuristics.");
@@ -201,7 +201,7 @@ async fn serve_batch(
 ) {
     let slot_arc = match state.batch_map.get(&batch_key) {
         Some(entry) => entry.value().clone(),
-        None => return, // already flushed
+        None => return, //already flushed
     };
 
     let senders = {
@@ -212,12 +212,12 @@ async fn serve_batch(
                 state.batch_map.remove(&batch_key);
                 std::mem::take(&mut locked.senders)
             },
-            BatchState::Serving => return, // already serving, idempotency check
+            BatchState::Serving => return, //already serving, idempotency check
         }
-    }; // lock dropped
+    }; //lock dropped
 
     let batch_size = senders.len();
-    // Recompute age at flush time
+    //recompute age at flush time
     let batch_age_ms = locked_created_at_elapsed(&slot_arc);
 
     let reason_str = reason.to_str();
@@ -298,7 +298,7 @@ async fn serve_batch(
         let _ = tx.send(cloned_resp);
     }
 
-    // emit telemetry
+    //emit telemetry
     if let Some(telemetry) = &state.telemetry {
         let timestamp_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

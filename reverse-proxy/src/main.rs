@@ -54,7 +54,7 @@ async fn main() {
         None
     };
 
-    // initialize telemetry publisher
+    //initialize telemetry publisher
     let telemetry = if config.kafka_enabled {
         match telemetry::TelemetryPublisher::new(&config.kafka_brokers, &config.kafka_telemetry_topic) {
             Ok(publisher) => {
@@ -70,7 +70,7 @@ async fn main() {
         None
     };
 
-    // initialize redis cache
+    //initialize redis cache
     let cache = if config.redis_enabled {
         match cache::ResponseCache::new(&config.redis_url, config.redis_cache_ttl).await {
             Ok(cache) => {
