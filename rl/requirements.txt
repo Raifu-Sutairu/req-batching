@@ -1,2 +1,10 @@
-grpcio==1.62.1
-grpcio-tools==1.62.1
+grpcio==1.63.0
+grpcio-tools==1.63.0
+protobuf==5.26.1
+numpy==1.26.4
+confluent-kafka==2.3.0
+stable-baselines3==2.3.0
+gymnasium==0.29.1
+torch==2.3.0
+onnx==1.16.0
+onnxruntime==1.17.1

@@ -12,4 +12,4 @@ WORKDIR /app/rl
 RUN bash generate.sh
 
 EXPOSE 50051
-CMD ["python", "grpc_stub/server.py"]
+CMD ["python", "grpc_server.py"]

@@ -40,6 +40,8 @@ services:
     volumes:
       - ./rl:/app/rl
       - ./reverse-proxy/proto:/app/reverse-proxy/proto
+    environment:
+      - PROXY_KAFKA_BROKERS=kafka:29092
     depends_on:
       - kafka
 
