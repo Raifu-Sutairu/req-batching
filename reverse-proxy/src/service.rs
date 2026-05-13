@@ -14,7 +14,7 @@ pub async fn handle_request(
     state: Arc<AppState>,
     config: Arc<Config>
 ) -> Result<hyper::Response<http_body_util::Full<Bytes>>, std::convert::Infallible> {
-    // Record incoming request for rate tracking
+    //record incoming request for rate tracking
     state.rate_counter.lock().unwrap().record();
 
     let decision = router::route(&req);
@@ -142,7 +142,7 @@ async fn serve_batch(
 
     let mut decision_reason = reason.to_string();
 
-    // Query RL Agent
+    //query RL Agent
     if let Some(rl_client_arc) = &state.rl_client {
         let agent_call = async {
             let mut client = rl_client_arc.lock().await;
