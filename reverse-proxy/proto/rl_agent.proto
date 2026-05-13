@@ -1,0 +1,19 @@
+syntax = "proto3";
+package rl_agent;
+
+//state vector describing a batch at decision time
+message BatchState {
+  uint32 batch_size       = 1;  //number of parked requests
+  float  batch_age_ms     = 2;  //milliseconds since first request arrived
+  float  upstream_p99_ms  = 3;  //rolling p99 upstream latency in ms
+  float  request_rate     = 4;  //requests/sec arriving at this key in last window
+}
+
+//binary decision returned by the agent
+message FlushDecision {
+  bool should_flush = 1;  //true = SERVE now, false = WAIT
+}
+
+service RlAgent {
+  rpc Decide(BatchState) returns (FlushDecision);
+}

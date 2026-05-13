@@ -12,8 +12,8 @@ pub enum BatchState{
 }
 
 //slots
-pub struct BatchSlot{
+pub struct BatchSlot {
     pub state: BatchState,
     pub created_at: std::time::Instant,
-    pub senders: Vec<tokio::sync::oneshot::Sender<hyper::Response<String>>>
+    pub senders: Vec<tokio::sync::oneshot::Sender<hyper::Response<http_body_util::Full<bytes::Bytes>>>>,
 }

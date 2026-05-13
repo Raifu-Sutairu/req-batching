@@ -8,3 +8,7 @@
 # Rust
 /reverse-proxy/target/
 **/*.rs.bk
+
+#Context
+DEVELOPMENT_ROADMAP.md
+LLM_CONTEXT.md
