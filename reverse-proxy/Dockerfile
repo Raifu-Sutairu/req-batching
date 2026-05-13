@@ -1,4 +1,4 @@
-FROM rust:latest as builder
+FROM rust:bookworm as builder
 WORKDIR /usr/src/app
 RUN apt-get update && apt-get install -y protobuf-compiler cmake pkg-config zlib1g-dev
 

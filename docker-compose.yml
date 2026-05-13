@@ -53,8 +53,8 @@ services:
       - PROXY_UPSTREAM_URL=http://mock-upstream:9090
       - PROXY_RL_AGENT_ADDR=http://rl-agent:50051
       - PROXY_RL_AGENT_TIMEOUT_MS=500
-      - KAFKA_BROKERS=kafka:29092
-      - REDIS_URL=redis://redis:6379
+      - PROXY_KAFKA_BROKERS=kafka:29092
+      - PROXY_REDIS_URL=redis://redis:6379
     depends_on:
       - mock-upstream
       - rl-agent

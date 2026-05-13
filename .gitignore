@@ -12,6 +12,7 @@
 #Context
 DEVELOPMENT_ROADMAP.md
 LLM_CONTEXT.md
+RL_ALGORITHM_DESIGN.md
 
 # Python
 rl/venv/*
