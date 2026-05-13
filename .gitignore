@@ -12,3 +12,9 @@
 #Context
 DEVELOPMENT_ROADMAP.md
 LLM_CONTEXT.md
+
+# Python
+rl/venv/*
+venv/
+__pycache__/
+rl/proto_out/
