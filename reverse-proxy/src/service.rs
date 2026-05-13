@@ -95,6 +95,7 @@ pub async fn handle_request(
 
             let slot_arc = {
                 let entry = state.batch_map.entry(key.clone()).or_insert_with(|| {
+                    crate::metrics::ACTIVE_BATCHES.inc();
                     Arc::new(std::sync::Mutex::new(BatchSlot{
                             state: BatchState::Waiting,
                             created_at: std::time::Instant::now(),
@@ -210,6 +211,7 @@ async fn serve_batch(
             BatchState::Waiting => {
                 locked.state = BatchState::Serving;
                 state.batch_map.remove(&batch_key);
+                crate::metrics::ACTIVE_BATCHES.dec();
                 std::mem::take(&mut locked.senders)
             },
             BatchState::Serving => return, //already serving, idempotency check
@@ -221,6 +223,9 @@ async fn serve_batch(
     let batch_age_ms = locked_created_at_elapsed(&slot_arc);
 
     let reason_str = reason.to_str();
+    crate::metrics::FLUSH_COUNTER.with_label_values(&[reason_str]).inc();
+    crate::metrics::BATCH_SIZE_HISTOGRAM.with_label_values(&[reason_str]).observe(batch_size as f64);
+    crate::metrics::BATCH_AGE_HISTOGRAM.with_label_values(&[reason_str]).observe(batch_age_ms as f64);
     if matches!(reason, FlushReason::Timeout) {
         tracing::info!(
             reason = %reason_str,

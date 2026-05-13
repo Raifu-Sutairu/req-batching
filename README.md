@@ -2,6 +2,19 @@
 
 **The PPO agent achieves 97.39% upstream call reduction while reducing median latency by 14.6% compared to a fixed timer baseline, with zero forced flushes** (see Figure 1 / Chart 1). Under bursty HTTP traffic, many identical GET requests arriving concurrently each trigger an independent upstream call, causing redundant load. We introduce an approach using RL-driven request coalescing in a Rust reverse proxy. The system parks requests in a shared slot and relies on a Proximal Policy Optimization (PPO) agent to decide the optimal time to dispatch a single upstream call per batch, rather than using static heuristics. The proxy safely operates within a hybrid envelope, achieving 97.39% upstream reduction, 43ms p50 latency, and a 0% forced flush rate. Code, evaluation harness, and trained ONNX model are included.
 
+## Table of Contents
+- [2. Introduction](#2-introduction)
+- [3. Related Work](#3-related-work)
+- [4. Background](#4-background)
+- [5. Methodology](#5-methodology)
+- [6. Results](#6-results)
+- [7. Conclusion](#7-conclusion)
+- [8. Future Work](#8-future-work)
+- [9. Project Layout](#9-project-layout)
+- [10. Getting Started](#10-getting-started)
+- [11. Authors and their contributions](#11-authors)
+- [12. License](#12-license)
+
 ## 2. Introduction
 
 Under bursty traffic, N identical GET requests each trigger an independent upstream call. Static heuristics (fixed timers, size caps) are either too conservative and waste latency, or too aggressive and cause tail latency spikes - such as the Fixed Size Cap policy, which reaches a catastrophic 4056ms p99 latency as a motivation for this work.
@@ -82,7 +95,6 @@ We built a Rust reverse proxy with a PPO-driven request coalescing agent to opti
 
 ## 8. Future Work
 
-- Prometheus metrics (Phase 5)
 - k6 load testing
 - online fine-tuning
 - multi-endpoint routing config
@@ -107,10 +119,6 @@ req-batching/
 ```
 
 ## 10. Getting Started
-
-### Prerequisites
-
-- Docker and Docker Compose
 
 ### Clone
 

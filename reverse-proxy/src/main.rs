@@ -10,6 +10,7 @@ mod router;
 
 mod telemetry;
 mod cache;
+mod metrics;
 
 #[tokio::main]
 async fn main() {
@@ -99,6 +100,38 @@ async fn main() {
 
     //shutdown channel
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+
+    //spawn metrics server
+    tokio::spawn(async move {
+        let addr: std::net::SocketAddr = "0.0.0.0:9090".parse().unwrap();
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        tracing::info!("Metrics server listening on {}", addr);
+        
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let io = hyper_util::rt::TokioIo::new(stream);
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(|_req: hyper::Request<hyper::body::Incoming>| async {
+                        use prometheus::Encoder;
+                        let encoder = prometheus::TextEncoder::new();
+                        let metric_families = prometheus::gather();
+                        let body = encoder.encode_to_string(&metric_families).unwrap();
+                        
+                        Ok::<_, std::convert::Infallible>(
+                            hyper::Response::builder()
+                                .header("Content-Type", "text/plain; version=0.0.4")
+                                .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                                .unwrap()
+                        )
+                    });
+                    
+                    if let Err(e) = hyper::server::conn::http1::Builder::new().serve_connection(io, service).await {
+                        tracing::error!("Metrics server error: {}", e);
+                    }
+                });
+            }
+        }
+    });
 
     //call listener's run()
     listener::run(app_state, config, shutdown_rx).await.unwrap();

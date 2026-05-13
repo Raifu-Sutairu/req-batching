@@ -1,0 +1,5 @@
+scrape_configs:
+  - job_name: req-batching
+    static_configs:
+      - targets: ["reverse-proxy:9090"]
+    scrape_interval: 2s

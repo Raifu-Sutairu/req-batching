@@ -1,0 +1,56 @@
+{
+  "title": "Batching Metrics",
+  "uid": "batching-metrics",
+  "refresh": "5s",
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "title": "Batch Flush Total (by reason)",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(batch_flush_total[$__rate_interval]))",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
+    },
+    {
+      "title": "Active Batch Slots",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "active_batch_slots",
+          "legendFormat": "Active Slots"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
+    },
+    {
+      "title": "Batch Size at Flush (Distribution)",
+      "type": "barchart",
+      "targets": [
+        {
+          "expr": "sum by (le) (increase(batch_size_at_flush_bucket[$__rate_interval]))",
+          "legendFormat": "{{le}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "title": "Batch Age MS at Flush (Distribution)",
+      "type": "barchart",
+      "targets": [
+        {
+          "expr": "sum by (le) (increase(batch_age_ms_at_flush_bucket[$__rate_interval]))",
+          "legendFormat": "{{le}}"
+        }
+      ],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    }
+  ],
+  "schemaVersion": 38
+}
