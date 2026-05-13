@@ -3,6 +3,7 @@ use std::sync::Arc;
 mod listener;
 mod config;
 mod state;
+mod proto;
 mod service;
 mod batch;
 mod router;
@@ -26,10 +27,29 @@ async fn main() {
     )
     .build_http();
 
+    //try to connect to the rl agent
+    let rl_client = if config.rl_agent_enabled {
+        match crate::proto::rl_agent::rl_agent_client::RlAgentClient::connect(config.rl_agent_addr.clone()).await {
+            Ok(client) => {
+                tracing::info!("Successfully connected to RL Agent");
+                Some(Arc::new(tokio::sync::Mutex::new(client)))
+            },
+            Err(e) => {
+                tracing::warn!("Failed to connect to RL Agent: {}. Falling back to heuristics.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     //dummy state struct
     let app_state = Arc::new(state::AppState {
         batch_map: dashmap::DashMap::new(),
         http_client,
+        rl_client,
+        latency_tracker: std::sync::Mutex::new(state::LatencyTracker::new(1000)),
+        rate_counter: std::sync::Mutex::new(state::RateCounter::new()),
     });
 
     //shutdown channel

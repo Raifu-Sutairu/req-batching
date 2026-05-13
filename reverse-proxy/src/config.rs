@@ -7,6 +7,9 @@ pub struct Config {
     pub max_connections: usize,
     pub batch_timeout_ms: u64,
     pub max_batch_size: usize,
+    pub rl_agent_addr: String,
+    pub rl_agent_timeout_ms: u64,
+    pub rl_agent_enabled: bool,
 }
 
 impl Config {

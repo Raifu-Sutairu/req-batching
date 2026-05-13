@@ -3,3 +3,6 @@ upstream_url = "http://127.0.0.1:9090"
 max_connections = 1000
 batch_timeout_ms = 50
 max_batch_size = 128
+rl_agent_addr = "http://127.0.0.1:50051"
+rl_agent_timeout_ms = 5
+rl_agent_enabled = true

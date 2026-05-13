@@ -14,6 +14,9 @@ pub async fn handle_request(
     state: Arc<AppState>,
     config: Arc<Config>
 ) -> Result<hyper::Response<http_body_util::Full<Bytes>>, std::convert::Infallible> {
+    // Record incoming request for rate tracking
+    state.rate_counter.lock().unwrap().record();
+
     let decision = router::route(&req);
 
     match decision {
@@ -44,8 +47,10 @@ pub async fn handle_request(
             };
             let req_full = Request::from_parts(parts, http_body_util::Full::new(body_bytes));
 
+            let start = std::time::Instant::now();
             match state.http_client.request(req_full).await {
                 Ok(resp) => {
+                    state.latency_tracker.lock().unwrap().record(start.elapsed().as_secs_f64() * 1000.0);
                     let (parts, body) = resp.into_parts();
                     let body_bytes = match body.collect().await {
                         Ok(c) => c.to_bytes(),
@@ -124,6 +129,50 @@ async fn serve_batch(
     config: Arc<Config>,
     reason: &str, 
 ) {
+    let (batch_size, batch_age_ms) = {
+        let locked = batch_slot.lock().unwrap();
+        if let BatchState::Serving = locked.state {
+            return;
+        }
+        (locked.senders.len() as u32, locked.created_at.elapsed().as_millis() as f32)
+    };
+
+    let p99 = state.latency_tracker.lock().unwrap().p99() as f32;
+    let rate = state.rate_counter.lock().unwrap().rate_per_sec() as f32;
+
+    let mut decision_reason = reason.to_string();
+
+    // Query RL Agent
+    if let Some(rl_client_arc) = &state.rl_client {
+        let agent_call = async {
+            let mut client = rl_client_arc.lock().await;
+            let req = tonic::Request::new(crate::proto::rl_agent::BatchState {
+                batch_size,
+                batch_age_ms,
+                upstream_p99_ms: p99,
+                request_rate: rate,
+            });
+            client.decide(req).await
+        };
+
+        match tokio::time::timeout(std::time::Duration::from_millis(config.rl_agent_timeout_ms), agent_call).await {
+            Ok(Ok(response)) => {
+                let decision = response.into_inner();
+                if !decision.should_flush {
+                    tracing::info!(batch_size = batch_size, batch_age_ms = batch_age_ms, "RL Agent decided to WAIT. Deferring flush.");
+                    return;
+                }
+                decision_reason = "RL Agent".to_string();
+            },
+            Ok(Err(e)) => {
+                tracing::warn!("RL Agent gRPC error: {}. Falling back to heuristics.", e);
+            },
+            Err(_) => {
+                tracing::warn!("RL Agent timeout. Falling back to heuristics.");
+            }
+        }
+    }
+
     let senders = {
         let mut locked = batch_slot.lock().unwrap();
         match locked.state {
@@ -136,7 +185,7 @@ async fn serve_batch(
         }
     }; //lock dropped
 
-    tracing::info!(reason = %reason, "Batch flushed");
+    tracing::info!(reason = %decision_reason, batch_size = senders.len(), "Batch flushed");
 
     let uri_string = format!("{}{}", config.upstream_url, batch_key.path);
     let uri: hyper::Uri = match uri_string.parse() {
@@ -156,8 +205,10 @@ async fn serve_batch(
         .body(http_body_util::Full::new(Bytes::new()))
         .unwrap();
 
+    let start = std::time::Instant::now();
     let response = match state.http_client.request(req).await {
         Ok(resp) => {
+            state.latency_tracker.lock().unwrap().record(start.elapsed().as_secs_f64() * 1000.0);
             let (parts, body) = resp.into_parts();
             let body_bytes = match body.collect().await {
                 Ok(c) => c.to_bytes(),
