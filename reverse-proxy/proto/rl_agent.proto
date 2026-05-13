@@ -4,7 +4,7 @@ package rl_agent;
 //state vector describing a batch at decision time
 message BatchState {
   uint32 batch_size       = 1;  //number of parked requests
-  float  batch_age_ms     = 2;  //milliseconds since first request arrived
+  float  batch_age_ms     = 2;  //milliseconds since first request in slot
   float  upstream_p99_ms  = 3;  //rolling p99 upstream latency in ms
   float  request_rate     = 4;  //requests/sec arriving at this key in last window
 }

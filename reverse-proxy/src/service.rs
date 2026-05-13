@@ -11,6 +11,27 @@ use crate::router;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::telemetry::BatchFlushEvent;
 
+#[derive(Debug, Clone)]
+pub enum FlushReason {
+    SizeCap,
+    Timeout,
+    RlAgent,
+    RlAgentTimeout,
+    RlAgentError,
+}
+
+impl FlushReason {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            FlushReason::SizeCap => "SizeCap",
+            FlushReason::Timeout => "Timeout",
+            FlushReason::RlAgent => "RlAgent",
+            FlushReason::RlAgentTimeout => "RlAgentTimeout",
+            FlushReason::RlAgentError => "RlAgentError",
+        }
+    }
+}
+
 pub async fn handle_request(
     mut req: Request<Incoming>,
     state: Arc<AppState>,
@@ -83,32 +104,80 @@ pub async fn handle_request(
                 entry.value().clone()
             }; //entry is dropped here, releasing the DashMap shard lock!
 
-            let (is_first, should_serve_now) = {
+            let (is_first, batch_size, batch_age_ms) = {
                 let mut slot = slot_arc.lock().unwrap();
                 slot.senders.push(tx);
-                (slot.senders.len() == 1, slot.senders.len() >= config.max_batch_size)
+                (slot.senders.len() == 1, slot.senders.len(), slot.created_at.elapsed().as_secs_f32() * 1000.0)
             };
 
-            let state_clone = state.clone();
-            let config_clone = config.clone();
-            
             if is_first {
-                let batch_slot_clone = slot_arc.clone();
-                let batch_key_clone = key.clone();
-                
+                let state_clone = Arc::clone(&state);
+                let key_clone = key.clone();
+                let timeout = config.batch_timeout_ms;
+                let config_clone = Arc::clone(&config);
                 tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(config_clone.batch_timeout_ms)).await;
-                    serve_batch(batch_slot_clone, batch_key_clone, state_clone, config_clone, "Timer expired").await;
+                    tokio::time::sleep(std::time::Duration::from_millis(timeout)).await;
+                    serve_batch(key_clone, state_clone, config_clone, FlushReason::Timeout).await;
                 });
             }
 
-            if should_serve_now {
-                let batch_slot_clone = slot_arc.clone();
-                let batch_key_clone = key.clone();
-                let state_clone2 = state.clone();
-                let config_clone2 = config.clone();
+            // Determine if we should flush
+            let mut reason = None;
+            
+            // HARD LIMIT 1: size cap
+            if batch_size >= config.max_batch_size {
+                reason = Some(FlushReason::SizeCap);
+            } 
+            // HARD LIMIT 2: timeout cap
+            else if batch_age_ms >= config.batch_timeout_ms as f32 {
+                reason = Some(FlushReason::Timeout);
+            } 
+            // SOFT DECISION: Ask RL agent
+            else {
+                let p99 = state.latency_tracker.lock().unwrap().p99() as f32;
+                let rate = state.rate_counter.lock().unwrap().rate_per_sec() as f32;
+
+                if let Some(rl_client_arc) = &state.rl_client {
+                    tracing::debug!(
+                        batch_age_ms = batch_age_ms,
+                        batch_size = batch_size,
+                        "Querying RL agent"
+                    );
+                    let agent_call = async {
+                        let mut client = rl_client_arc.lock().await;
+                        let req = tonic::Request::new(crate::proto::rl_agent::BatchState {
+                            batch_size: batch_size as u32,
+                            batch_age_ms,
+                            upstream_p99_ms: p99,
+                            request_rate: rate,
+                        });
+                        client.decide(req).await
+                    };
+
+                    match tokio::time::timeout(std::time::Duration::from_millis(config.rl_agent_timeout_ms), agent_call).await {
+                        Ok(Ok(response)) => {
+                            let decision = response.into_inner();
+                            if decision.should_flush {
+                                reason = Some(FlushReason::RlAgent);
+                            }
+                        },
+                        Ok(Err(e)) => {
+                            tracing::warn!("RL Agent gRPC error: {}. Falling back to heuristics.", e);
+                            // We don't flush immediately, we let heuristics take over when limits are reached
+                        },
+                        Err(_) => {
+                            tracing::warn!("RL Agent timeout. Falling back to heuristics.");
+                        }
+                    }
+                }
+            }
+
+            if let Some(r) = reason {
+                let key_clone = key.clone();
+                let state_clone = Arc::clone(&state);
+                let config_clone = Arc::clone(&config);
                 tokio::spawn(async move {
-                    serve_batch(batch_slot_clone, batch_key_clone, state_clone2, config_clone2, "Size limit reached").await;
+                    serve_batch(key_clone, state_clone, config_clone, r).await;
                 });
             }
 
@@ -125,69 +194,42 @@ pub async fn handle_request(
 }
 
 async fn serve_batch(
-    batch_slot: Arc<std::sync::Mutex<BatchSlot>>,
     batch_key: BatchKey,
     state: Arc<AppState>,
     config: Arc<Config>,
-    reason: &str, 
+    reason: FlushReason, 
 ) {
-    let (batch_size, batch_age_ms) = {
-        let locked = batch_slot.lock().unwrap();
-        if let BatchState::Serving = locked.state {
-            return;
-        }
-        (locked.senders.len() as u32, locked.created_at.elapsed().as_millis() as f32)
+    let slot_arc = match state.batch_map.get(&batch_key) {
+        Some(entry) => entry.value().clone(),
+        None => return, // already flushed
     };
 
-    let p99 = state.latency_tracker.lock().unwrap().p99() as f32;
-    let rate = state.rate_counter.lock().unwrap().rate_per_sec() as f32;
-
-    let mut decision_reason = reason.to_string();
-
-    //query RL Agent
-    if let Some(rl_client_arc) = &state.rl_client {
-        let agent_call = async {
-            let mut client = rl_client_arc.lock().await;
-            let req = tonic::Request::new(crate::proto::rl_agent::BatchState {
-                batch_size,
-                batch_age_ms,
-                upstream_p99_ms: p99,
-                request_rate: rate,
-            });
-            client.decide(req).await
-        };
-
-        match tokio::time::timeout(std::time::Duration::from_millis(config.rl_agent_timeout_ms), agent_call).await {
-            Ok(Ok(response)) => {
-                let decision = response.into_inner();
-                if !decision.should_flush {
-                    tracing::info!(batch_size = batch_size, batch_age_ms = batch_age_ms, "RL Agent decided to WAIT. Deferring flush.");
-                    return;
-                }
-                decision_reason = "RL Agent".to_string();
-            },
-            Ok(Err(e)) => {
-                tracing::warn!("RL Agent gRPC error: {}. Falling back to heuristics.", e);
-            },
-            Err(_) => {
-                tracing::warn!("RL Agent timeout. Falling back to heuristics.");
-            }
-        }
-    }
-
     let senders = {
-        let mut locked = batch_slot.lock().unwrap();
+        let mut locked = slot_arc.lock().unwrap();
         match locked.state {
             BatchState::Waiting => {
                 locked.state = BatchState::Serving;
                 state.batch_map.remove(&batch_key);
                 std::mem::take(&mut locked.senders)
             },
-            BatchState::Serving => return, //already serving
+            BatchState::Serving => return, // already serving, idempotency check
         }
-    }; //lock dropped
+    }; // lock dropped
 
-    tracing::info!(reason = %decision_reason, batch_size = senders.len(), "Batch flushed");
+    let batch_size = senders.len();
+    // Recompute age at flush time
+    let batch_age_ms = locked_created_at_elapsed(&slot_arc);
+
+    let reason_str = reason.to_str();
+    if matches!(reason, FlushReason::Timeout) {
+        tracing::info!(
+            reason = %reason_str,
+            batch_size = batch_size,
+            "Heuristic timer fired — flushing batch"
+        );
+    } else {
+        tracing::info!(reason = %reason_str, batch_size = batch_size, "Batch flushed");
+    }
 
     let cache_key = format!("{}:{}", batch_key.method, batch_key.path);
     let mut cache_hit = false;
@@ -232,7 +274,6 @@ async fn serve_batch(
                     Err(_) => Bytes::new()
                 };
 
-                // cache the response if it's a 200 OK
                 if status_code == hyper::StatusCode::OK {
                     if let Some(cache) = &state.cache {
                         cache.set(&cache_key, response_body.clone()).await;
@@ -249,7 +290,6 @@ async fn serve_batch(
 
     let upstream_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    //clone the response for all senders
     for tx in senders {
         let cloned_resp = hyper::Response::builder()
             .status(status_code)
@@ -260,20 +300,25 @@ async fn serve_batch(
 
     // emit telemetry
     if let Some(telemetry) = &state.telemetry {
-        let timestamp_unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+        let timestamp_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
-        let event = BatchFlushEvent {
+        let event = crate::telemetry::BatchFlushEvent {
             batch_key: format!("{}:{}", batch_key.method, batch_key.path),
             batch_size: batch_size as usize,
             batch_age_ms: batch_age_ms as f64,
             upstream_ms,
-            flush_reason: decision_reason,
+            flush_reason: reason_str.to_string(),
             timestamp_unix,
         };
 
         telemetry.publish_flush(event).await;
     }
+}
+
+fn locked_created_at_elapsed(slot_arc: &Arc<std::sync::Mutex<BatchSlot>>) -> f32 {
+    let locked = slot_arc.lock().unwrap();
+    locked.created_at.elapsed().as_secs_f32() * 1000.0
 }

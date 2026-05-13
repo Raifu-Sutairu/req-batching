@@ -33,8 +33,28 @@ def main():
         logger.error("No telemetry data found! Run the proxy and generate GET traffic first.")
         return
         
+    raw_episodes = list(consumer.buffer)
+    
+    # Filter out corrupted records caused by the old microsecond bug
+    episodes = [e for e in raw_episodes if max([s.batch_age_ms for s in e.steps] + [0]) <= 100]
+    logger.info(f"Kept {len(episodes)} / {len(raw_episodes)} episodes after unit-mismatch filter")
+    
+    if len(episodes) < 10000:
+        logger.warning(f"Only {len(episodes)} clean episodes remain. Consider flushing the Kafka topic and generating fresh data if model quality is poor.")
+    
+    logger.info("--- Kafka Data Audit ---")
+    for name, values in [
+        ("batch_size",      [s.batch_size for e in episodes for s in e.steps]),
+        ("batch_age_ms",    [s.batch_age_ms for e in episodes for s in e.steps]),
+        ("upstream_p99_ms", [s.upstream_p99_ms for e in episodes for s in e.steps]),
+        ("request_rate",    [s.request_rate for e in episodes for s in e.steps]),
+    ]:
+        if values:
+            logger.info(f"{name}: min={min(values):.2f} max={max(values):.2f} mean={sum(values)/len(values):.2f}")
+    logger.info("------------------------")
+        
     # 2. Create Gymnasium environment
-    env = BatchFlushEnv(list(consumer.buffer))
+    env = BatchFlushEnv(episodes)
     
     # 3. Create and train PPO model
     logger.info("Initialising PPO model...")

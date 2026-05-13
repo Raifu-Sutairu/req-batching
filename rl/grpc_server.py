@@ -33,6 +33,11 @@ class RlAgentServicer(rl_agent_pb2_grpc.RlAgentServicer):
             logger.info(f"Loaded ONNX model from {onnx_path}")
 
     def Decide(self, request, context):
+        # Sanity check — 3x multiplier is purely a unit-mismatch detector (since the Rust hard-limit should enforce 1x)
+        # Do not raise this limit! If it fires, Rust is likely sending microseconds instead of milliseconds.
+        assert request.batch_age_ms <= config.batch_timeout_ms * 3, \
+            f"batch_age_ms={request.batch_age_ms} far exceeds timeout, unit mismatch suspected"
+
         if self.session is None:
             # Fallback heuristic
             should_flush = request.batch_size >= config.max_batch_size or request.batch_age_ms >= config.batch_timeout_ms

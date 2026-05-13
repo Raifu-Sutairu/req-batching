@@ -15,11 +15,11 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class TelemetryConsumer:
-    def __init__(self, buffer_size=10000):
+    def __init__(self, buffer_size=10000, group_id="rl-training-group"):
         self.buffer = deque(maxlen=buffer_size)
         conf = {
             'bootstrap.servers': config.kafka_brokers,
-            'group.id': 'rl-training-group',
+            'group.id': group_id,
             'auto.offset.reset': 'earliest'
         }
         self.consumer = Consumer(conf)

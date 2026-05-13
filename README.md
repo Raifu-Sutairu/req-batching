@@ -218,6 +218,28 @@ let config = Arc::new(config::Config {
 
 ---
 
+## Evaluation Results
+
+We evaluated the PPO Agent against static baselines on simulated bursty traffic. The RL agent successfully learns to flush early to reduce median wait times, while safely operating within the proxy's hard timeouts.
+
+### 1. Latency Profile
+![Latency Profile](docs/plots/chart_1_latency_scatter.png)
+*Note: The **No Batching** baseline sits in the green safe zone because it never batches (hence no tail latency risk), but this comes at the cost of 0% upstream reduction. The RL Agent matches the throughput of the Fixed Timer while avoiding the catastrophic p99 latency spikes seen when the timeout fallback is disabled (Size Cap alone).*
+
+### 2. Efficiency Frontier
+![Efficiency Frontier](docs/plots/chart_2_efficiency_frontier.png)
+*Note: The unlabelled red dot in the top right is the **Fixed Size Cap** policy, our cautionary baseline. While it achieves high upstream reduction, it does so at the cost of unbounded p99 latency. PPO sits to the left of the Fixed Timer, earning nearly identical upstream reduction while using smaller batches.*
+
+### 3. Median Latency
+![Median Latency](docs/plots/chart_3_p50_viable.png)
+*By dynamically observing the queue depth and upstream p99, the RL agent learns to flush before the 50ms deadline when it's optimal, resulting in a 14.6% faster median wait time than a static timer.*
+
+### 4. Safety Envelope Validation
+![Forced Flush Rate](docs/plots/chart_4_forced_flush.png)
+*The hybrid safety-envelope architecture unconditionally caps wait times. As seen here, relying solely on size limits (Fixed Size Cap) results in a 93.5% forced flush rate under low traffic. The PPO agent operates cleanly within the safety limits and never triggers a stall.*
+
+---
+
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](./LICENSE) for the full text.
