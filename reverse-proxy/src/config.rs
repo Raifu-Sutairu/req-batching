@@ -10,6 +10,12 @@ pub struct Config {
     pub rl_agent_addr: String,
     pub rl_agent_timeout_ms: u64,
     pub rl_agent_enabled: bool,
+    pub kafka_brokers: String,
+    pub kafka_telemetry_topic: String,
+    pub kafka_enabled: bool,
+    pub redis_url: String,
+    pub redis_cache_ttl: u64,
+    pub redis_enabled: bool,
 }
 
 impl Config {

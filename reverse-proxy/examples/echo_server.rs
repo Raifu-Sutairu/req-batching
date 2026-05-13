@@ -14,8 +14,8 @@ async fn main() {
         )
         .with_state(hit_counter);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:9090").await.unwrap();
-    println!("Echo server listening on 127.0.0.1:9090");
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:9090").await.unwrap();
+    println!("Echo server listening on 0.0.0.0:9090");
     axum::serve(listener, app).await.unwrap();
 }
 

@@ -6,3 +6,11 @@ max_batch_size = 128
 rl_agent_addr = "http://127.0.0.1:50051"
 rl_agent_timeout_ms = 5
 rl_agent_enabled = true
+
+kafka_brokers = "127.0.0.1:9092"
+kafka_telemetry_topic = "batch-telemetry"
+kafka_enabled = true
+
+redis_url = "redis://127.0.0.1:6379"
+redis_cache_ttl = 5
+redis_enabled = true

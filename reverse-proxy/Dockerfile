@@ -1,6 +1,6 @@
-FROM rust:1.76 as builder
+FROM rust:latest as builder
 WORKDIR /usr/src/app
-RUN apt-get update && apt-get install -y protobuf-compiler
+RUN apt-get update && apt-get install -y protobuf-compiler cmake pkg-config zlib1g-dev
 
 COPY . .
 RUN cargo build --release

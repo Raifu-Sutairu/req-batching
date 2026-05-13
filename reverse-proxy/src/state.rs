@@ -75,6 +75,8 @@ pub struct AppState {
     pub batch_map: dashmap::DashMap<batch::BatchKey, Arc<std::sync::Mutex<batch::BatchSlot>>>,
     pub http_client: Client<HttpConnector, Full<Bytes>>,
     pub rl_client: Option<Arc<AsyncMutex<RlAgentClient<Channel>>>>,
+    pub telemetry: Option<Arc<crate::telemetry::TelemetryPublisher>>,
+    pub cache: Option<crate::cache::ResponseCache>,
     pub latency_tracker: std::sync::Mutex<LatencyTracker>,
     pub rate_counter: std::sync::Mutex<RateCounter>,
 }

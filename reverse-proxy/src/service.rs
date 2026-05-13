@@ -8,6 +8,8 @@ use crate::state::AppState;
 use crate::batch::{BatchSlot, BatchState, BatchKey};
 use crate::config::Config;
 use crate::router;
+use std::time::{SystemTime, UNIX_EPOCH};
+use crate::telemetry::BatchFlushEvent;
 
 pub async fn handle_request(
     mut req: Request<Incoming>,
@@ -187,54 +189,91 @@ async fn serve_batch(
 
     tracing::info!(reason = %decision_reason, batch_size = senders.len(), "Batch flushed");
 
-    let uri_string = format!("{}{}", config.upstream_url, batch_key.path);
-    let uri: hyper::Uri = match uri_string.parse() {
-        Ok(u) => u,
-        Err(_) => {
-            tracing::error!("Failed to parse upstream URI");
-            for tx in senders {
-                let _ = tx.send(hyper::Response::builder().status(502).body(http_body_util::Full::new(Bytes::from("upstream error"))).unwrap());
-            }
-            return;
-        }
-    };
+    let cache_key = format!("{}:{}", batch_key.method, batch_key.path);
+    let mut cache_hit = false;
+    let mut response_body = Bytes::new();
+    let mut status_code = hyper::StatusCode::OK;
 
-    let req = Request::builder()
-        .method(batch_key.method)
-        .uri(uri)
-        .body(http_body_util::Full::new(Bytes::new()))
-        .unwrap();
+    if let Some(cache) = &state.cache {
+        if let Some(cached_bytes) = cache.get(&cache_key).await {
+            cache_hit = true;
+            response_body = cached_bytes;
+        }
+    }
 
     let start = std::time::Instant::now();
-    let response = match state.http_client.request(req).await {
-        Ok(resp) => {
-            state.latency_tracker.lock().unwrap().record(start.elapsed().as_secs_f64() * 1000.0);
-            let (parts, body) = resp.into_parts();
-            let body_bytes = match body.collect().await {
-                Ok(c) => c.to_bytes(),
-                Err(_) => Bytes::new()
-            };
-            hyper::Response::from_parts(parts, http_body_util::Full::new(body_bytes))
-        },
-        Err(e) => {
-            tracing::error!("Batch upstream error: {:?}", e);
-            hyper::Response::builder()
-                .status(502)
-                .body(http_body_util::Full::new(Bytes::from("upstream error")))
-                .unwrap()
-        }
-    };
+
+    if !cache_hit {
+        let uri_string = format!("{}{}", config.upstream_url, batch_key.path);
+        let uri: hyper::Uri = match uri_string.parse() {
+            Ok(u) => u,
+            Err(_) => {
+                tracing::error!("Failed to parse upstream URI");
+                for tx in senders {
+                    let _ = tx.send(hyper::Response::builder().status(502).body(http_body_util::Full::new(Bytes::from("upstream error"))).unwrap());
+                }
+                return;
+            }
+        };
+
+        let req = Request::builder()
+            .method(batch_key.method.clone())
+            .uri(uri)
+            .body(http_body_util::Full::new(Bytes::new()))
+            .unwrap();
+
+        match state.http_client.request(req).await {
+            Ok(resp) => {
+                state.latency_tracker.lock().unwrap().record(start.elapsed().as_secs_f64() * 1000.0);
+                let (parts, body) = resp.into_parts();
+                status_code = parts.status;
+                response_body = match body.collect().await {
+                    Ok(c) => c.to_bytes(),
+                    Err(_) => Bytes::new()
+                };
+
+                // cache the response if it's a 200 OK
+                if status_code == hyper::StatusCode::OK {
+                    if let Some(cache) = &state.cache {
+                        cache.set(&cache_key, response_body.clone()).await;
+                    }
+                }
+            },
+            Err(e) => {
+                tracing::error!("Batch upstream error: {:?}", e);
+                status_code = hyper::StatusCode::BAD_GATEWAY;
+                response_body = Bytes::from("upstream error");
+            }
+        };
+    }
+
+    let upstream_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     //clone the response for all senders
-    let (parts, body) = response.into_parts();
     for tx in senders {
-        let mut cloned_parts = hyper::Response::builder()
-            .status(parts.status.clone())
-            .version(parts.version.clone());
-        for (k, v) in parts.headers.iter() {
-            cloned_parts = cloned_parts.header(k.clone(), v.clone());
-        }
-        let cloned_resp = cloned_parts.body(body.clone()).unwrap();
+        let cloned_resp = hyper::Response::builder()
+            .status(status_code)
+            .body(http_body_util::Full::new(response_body.clone()))
+            .unwrap();
         let _ = tx.send(cloned_resp);
+    }
+
+    // emit telemetry
+    if let Some(telemetry) = &state.telemetry {
+        let timestamp_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let event = BatchFlushEvent {
+            batch_key: format!("{}:{}", batch_key.method, batch_key.path),
+            batch_size: batch_size as usize,
+            batch_age_ms: batch_age_ms as f64,
+            upstream_ms,
+            flush_reason: decision_reason,
+            timestamp_unix,
+        };
+
+        telemetry.publish_flush(event).await;
     }
 }

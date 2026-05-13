@@ -27,7 +27,7 @@ services:
     build: 
       context: ./reverse-proxy
       dockerfile: Dockerfile
-    command: cargo run --example echo_server
+    command: ./echo_server
     ports:
       - "9090:9090"
 
@@ -52,6 +52,7 @@ services:
     environment:
       - PROXY_UPSTREAM_URL=http://mock-upstream:9090
       - PROXY_RL_AGENT_ADDR=http://rl-agent:50051
+      - PROXY_RL_AGENT_TIMEOUT_MS=500
       - KAFKA_BROKERS=kafka:29092
       - REDIS_URL=redis://redis:6379
     depends_on:
