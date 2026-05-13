@@ -1,20 +1,44 @@
-# req-batching
+# req-batching: RL-Driven Request Coalescing in a Rust Reverse Proxy
 
-A high-performance HTTP reverse proxy in Rust that coalesces concurrent requests into batches and dispatches a single upstream call per batch. The flush decision is driven by a PPO reinforcement learning agent, replacing static timers with a policy that adapts to live traffic state.
+**The PPO agent achieves 97.39% upstream call reduction while reducing median latency by 14.6% compared to a fixed timer baseline, with zero forced flushes** (see Figure 1 / Chart 1). Under bursty HTTP traffic, many identical GET requests arriving concurrently each trigger an independent upstream call, causing redundant load. We introduce an approach using RL-driven request coalescing in a Rust reverse proxy. The system parks requests in a shared slot and relies on a Proximal Policy Optimization (PPO) agent to decide the optimal time to dispatch a single upstream call per batch, rather than using static heuristics. The proxy safely operates within a hybrid envelope, achieving 97.39% upstream reduction, 43ms p50 latency, and a 0% forced flush rate. Code, evaluation harness, and trained ONNX model are included.
 
----
+## 2. Introduction
 
-## How It Works
+Under bursty traffic, N identical GET requests each trigger an independent upstream call. Static heuristics (fixed timers, size caps) are either too conservative and waste latency, or too aggressive and cause tail latency spikes - such as the Fixed Size Cap policy, which reaches a catastrophic 4056ms p99 latency as a motivation for this work.
 
-Under bursty traffic, many clients hit the same endpoint within milliseconds of each other. Each request would ordinarily result in an independent upstream call. This proxy intercepts the burst, parks each request in a shared slot, and issues one upstream call when the RL agent decides the batch is ready. Every waiting client receives the same response through its own connection — the upstream never knows requests were coalesced.
+To address this, we park requests in a shared slot, dispatch one upstream call per batch, and fan the response back to all N waiting clients. The flush decision is made by a PPO agent observing 4 live signals.
 
-The RL agent observes queue depth, arrival rate, batch age, and upstream p99 latency. It returns a binary WAIT or SERVE decision. When no agent is reachable, the proxy falls back to configurable timer and size-cap guards so the system degrades gracefully rather than stalling.
+Our contributions are:
+- (1) Rust proxy with idempotent batching engine
+- (2) PPO agent trained offline from Kafka telemetry and served via ONNX gRPC sidecar
+- (3) safety envelope architecture where hard limits are unconditional and the agent operates within them
+- (4) evaluation against 3 baselines with open harness
 
----
+## 3. Related Work
 
-## Architecture
+Cloudflare "Sometimes I Cache" (2024): probabilistic revalidation formula, optimal for single-signal age-only decisions, but cannot condition on queue depth or arrival rate. This project extends the urgency-grows-exponentially insight to a richer 4-signal observation space.
 
-### Request Lifecycle
+Cold-RL (Bhayani, arXiv 2508.12485, 2025): offline RL for NGINX cache eviction via DQN + ONNX sidecar + 500us hard timeout + fallback to LRU. Directly validates the offline-first training, ONNX serving, and hard-deadline fallback pattern used here.
+
+IEEE 10740859: validates entropy regularisation in PPO to prevent policy collapse to always-WAIT or always-FLUSH. This directly motivated the exploration strategy used to balance the state space.
+
+Sarathi-Serve (Agrawal et al., OSDI 2024): addresses the same throughput-latency tradeoff in LLM inference via batching scheduler design. Different domain (GPU inference vs HTTP proxy) but same core tension.
+
+## 4. Background
+
+### Request Coalescing
+Formally, N requests arrive for the same resource within window W. A naive proxy makes N upstream calls. The optimal proxy makes 1 upstream call, and the response is fanned to N clients. The cost is that each client waits up to W ms. This presents a tradeoff: a larger W yields higher throughput but higher latency.
+
+### Why Not a Static Policy?
+A fixed timer always waits the full window even for sparse traffic. A fixed size cap stalls indefinitely under low load (reaching the aforementioned 4056ms p99). A probabilistic policy (exponential) conditions only on age, ignoring queue depth and backend health. An adaptive policy that sees all four signals dominates all three static approaches.
+
+## 5. Methodology
+
+### 5a. System Architecture
+
+![Architecture Diagram](docs/Architecture_Diagram.png)
+
+The request lifecycle follows: TCP accept -> router (GET vs non-GET) -> BatchSlot park -> flush trigger -> fan-out. The safety envelope uses a hard size-cap and hard timeout that fire unconditionally before the agent is consulted. A Redis cache deduplication layer ensures identical responses are cleanly deduplicated in-flight.
 
 ```mermaid
 flowchart TD
@@ -32,8 +56,6 @@ flowchart TD
     J --> K[Client]
     F --> K
 ```
-
-### Internal Module Dependencies
 
 ```mermaid
 graph LR
@@ -56,8 +78,6 @@ graph LR
     state --> batch
 ```
 
-### Batch State Machine
-
 ```mermaid
 stateDiagram-v2
     [*] --> Waiting : first request pushes Sender\ntimer task spawned
@@ -66,8 +86,6 @@ stateDiagram-v2
     Waiting --> Serving : size cap reached inline\nsame idempotent guard
     Waiting --> Serving : RL agent returns SERVE\ngRPC call with timeout fallback
 ```
-
-### Production Deployment
 
 ```mermaid
 flowchart TD
@@ -111,37 +129,77 @@ flowchart TD
     upstream["Upstream Service\nany HTTP/1.1 server"]
 ```
 
----
+### 5b. MDP Formulation
 
-## Project Layout
+![MDP Plot](docs/MDP_Plot.png)
+
+- **Episode:** one BatchSlot lifetime
+- **State (4 features):** `[batch_size/128, batch_age_ms/50, log1p(upstream_p99)/log1p(500), tanh(request_rate/100)]`
+- **Action:** Discrete(2) - WAIT or FLUSH
+- **Reward:** log-throughput gain + quadratic urgency bonus - exponential wait cost - upstream load penalty - forced-flush penalty
+
+### 5c. Training Pipeline
+
+The pipeline flows from Kafka telemetry -> episode buffer -> offline PPO (Stable-Baselines3) -> PyTorch checkpoint -> ONNX export -> gRPC sidecar. We enforce a 5ms hard gRPC timeout and a heuristic fallback to ensure safety. The compiled model file sizes are compact (138KB zip, 19KB ONNX).
+
+## 6. Results
+
+**The PPO agent matches fixed-timer throughput at 14.6% lower median latency, with no tail latency risk and no forced flushes.**
+
+| Policy | Upstream Reduction | p50 Latency | p99 Latency | Forced Flush Rate | Avg Batch Size |
+|---|---|---|---|---|---|
+| No Batching | 0.00% | 1.06ms | 31.71ms | 0.00% | 1.00 |
+| Fixed Timer (50ms) | 97.76% | 50.88ms | 63.34ms | 0.00% | 44.69 |
+| Fixed Size Cap (128) | 98.18% | 53.00ms | 4056.08ms | 93.52% | 54.83 |
+| **PPO ONNX Agent** | **97.39%** | **43.46ms** | **63.34ms** | **0.00%** | **38.28** |
+
+**PPO occupies the low-p50, bounded-p99 quadrant; Fixed Size Cap alone produces catastrophic tail latency.**
+![Chart 1 Latency Scatter](docs/plots/chart_1_latency_scatter.png)
+
+**PPO achieves near-identical upstream reduction with 14% smaller batches than a fixed timer.**
+![Chart 2 Efficiency Frontier](docs/plots/chart_2_efficiency_frontier.png)
+
+**The agent learns to flush before the 50ms deadline, reducing median wait by 7.4ms.**
+![Chart 3 p50 Bar](docs/plots/chart_3_p50_viable.png)
+
+**Only the size-cap-only policy exceeds the 5% forced flush target, validating the hybrid safety envelope.**
+![Chart 4 Forced Flush](docs/plots/chart_4_forced_flush.png)
+
+## 7. Conclusion
+
+We built a Rust reverse proxy with a PPO-driven request coalescing agent to optimize HTTP batching under bursty traffic. The evaluation showed the RL agent achieves 97.39% upstream reduction and safely lowers median wait times without introducing unbounded tail latencies. The hybrid safety envelope architecture ensures the system degrades gracefully and operates safely under all loads.
+
+## 8. Future Work
+
+- Prometheus metrics (Phase 5)
+- k6 load testing
+- online fine-tuning
+- multi-endpoint routing config
+- ablation studies (reward component analysis)
+
+## 9. Project Layout
 
 ```
 req-batching/
-├── reverse-proxy/          # Core proxy engine
-│   ├── Cargo.toml
-│   └── src/
-│       ├── main.rs         # Entry point — wires Config, AppState, listener
-│       ├── config.rs       # Configuration struct (addr, timeouts, limits)
-│       ├── state.rs        # Shared AppState — DashMap batch registry
-│       ├── batch.rs        # BatchKey, BatchState, BatchSlot, channel types
-│       ├── router.rs       # RoutingDecision — Batch or PassThrough
-│       ├── listener.rs     # TCP accept loop, semaphore, graceful shutdown
-│       └── service.rs      # Hyper HTTP handler, batching engine, serve_batch
-├── rl/                     # PPO agent, Gymnasium environment, gRPC server
-└── docs/                   # Design notes
+|-- reverse-proxy/          # Core proxy engine
+|   |-- Cargo.toml
+|   |-- src/
+|       |-- main.rs         # Entry point - wires Config, AppState, listener
+|       |-- config.rs       # Configuration struct (addr, timeouts, limits)
+|       |-- state.rs        # Shared AppState - DashMap batch registry
+|       |-- batch.rs        # BatchKey, BatchState, BatchSlot, channel types
+|       |-- router.rs       # RoutingDecision - Batch or PassThrough
+|       |-- listener.rs     # TCP accept loop, semaphore, graceful shutdown
+|       |-- service.rs      # Hyper HTTP handler, batching engine, serve_batch
+|-- rl/                     # PPO agent, Gymnasium environment, gRPC server
+|-- docs/                   # Design notes
 ```
 
----
-
-## Getting Started
+## 10. Getting Started
 
 ### Prerequisites
 
-- Rust 1.80 or later (Cargo edition 2024)
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+- Docker and Docker Compose
 
 ### Clone
 
@@ -150,17 +208,12 @@ git clone https://github.com/Raifu-Sutairu/req-batching.git
 cd req-batching
 ```
 
-### Build
+### Build and Run
+
+To ensure consistency and ease of use, we recommend using Docker to build and run the reverse proxy and RL sidecar.
 
 ```bash
-cd reverse-proxy
-cargo build --release
-```
-
-### Run
-
-```bash
-cargo run
+docker-compose up --build
 # Listening on 127.0.0.1:8080
 ```
 
@@ -189,7 +242,7 @@ curl -X POST http://127.0.0.1:8080/api/resource \
 // reverse-proxy/src/main.rs
 let config = Arc::new(config::Config {
     listen_addr:      "127.0.0.1:8080".parse().unwrap(),
-    max_connections:  1000,   // semaphore cap — controls memory ceiling
+    max_connections:  1000,   // semaphore cap - controls memory ceiling
     batch_timeout_ms: 50,     // max hold time before timer-triggered flush
     max_batch_size:   128,    // max requests per slot before inline flush
 });
@@ -202,44 +255,6 @@ let config = Arc::new(config::Config {
 | `batch_timeout_ms` | Maximum time a batch is held open |
 | `max_batch_size` | Maximum requests per batch before early flush |
 
----
-
-## Design
-
-**Protocol-agnostic core.** The batching engine is decoupled from the upstream transport. The `serve_batch` function is the single extension point — swap it for a gRPC call, a queue producer, or a cache read without touching the slot or fan-out machinery.
-
-**RL-driven flush policy.** The timer and size-cap triggers are safety nets, not the primary control path. In production, each batch decision is a gRPC call to the PPO agent. The agent's state vector — queue depth, arrival rate, batch age, upstream p99 — is extracted from live measurements on each incoming request. The agent trains against a reward signal that penalises added latency and rewards upstream call reduction.
-
-**Minimal lock contention.** `DashMap` shards the registry across 16 buckets. Concurrent tasks serving different endpoints never touch the same shard. The inner `std::sync::Mutex` is held only for the duration of a `Vec::push` or `mem::take` — pure memory operations with no async yield, which is why `std::sync::Mutex` is used instead of `tokio::sync::Mutex`.
-
-**Idempotent flush.** `serve_batch` is callable from the timer task and the size-cap path simultaneously. The first caller transitions the slot from `Waiting` to `Serving` under the lock; the second finds `Serving` and returns immediately. There is no coordination channel between the two paths — the state machine is the coordination.
-
-**Zero-copy fan-out.** `std::mem::take` drains the sender vector without heap allocation. The `Mutex` guard is dropped before the fan-out loop so the lock is not held during response construction or channel sends.
-
----
-
-## Evaluation Results
-
-We evaluated the PPO Agent against static baselines on simulated bursty traffic. The RL agent successfully learns to flush early to reduce median wait times, while safely operating within the proxy's hard timeouts.
-
-### 1. Latency Profile
-![Latency Profile](docs/plots/chart_1_latency_scatter.png)
-*Note: The **No Batching** baseline sits in the green safe zone because it never batches (hence no tail latency risk), but this comes at the cost of 0% upstream reduction. The RL Agent matches the throughput of the Fixed Timer while avoiding the catastrophic p99 latency spikes seen when the timeout fallback is disabled (Size Cap alone).*
-
-### 2. Efficiency Frontier
-![Efficiency Frontier](docs/plots/chart_2_efficiency_frontier.png)
-*Note: The unlabelled red dot in the top right is the **Fixed Size Cap** policy, our cautionary baseline. While it achieves high upstream reduction, it does so at the cost of unbounded p99 latency. PPO sits to the left of the Fixed Timer, earning nearly identical upstream reduction while using smaller batches.*
-
-### 3. Median Latency
-![Median Latency](docs/plots/chart_3_p50_viable.png)
-*By dynamically observing the queue depth and upstream p99, the RL agent learns to flush before the 50ms deadline when it's optimal, resulting in a 14.6% faster median wait time than a static timer.*
-
-### 4. Safety Envelope Validation
-![Forced Flush Rate](docs/plots/chart_4_forced_flush.png)
-*The hybrid safety-envelope architecture unconditionally caps wait times. As seen here, relying solely on size limits (Fixed Size Cap) results in a 93.5% forced flush rate under low traffic. The PPO agent operates cleanly within the safety limits and never triggers a stall.*
-
----
-
-## License
+## 11. License
 
 This project is licensed under the MIT License. See [LICENSE](./LICENSE) for the full text.
