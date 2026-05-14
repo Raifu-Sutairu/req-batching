@@ -27,10 +27,12 @@ from Ashrith.predictive_dynaq_agent import PredictiveDynaQAgent
 
 def get_checkpoint_path(agent_type: str, kind: str) -> str:
     """Return the checkpoint path for an agent and checkpoint kind."""
+    # predictive dynaq artifacts are kept in the main checkpoint folder
     if agent_type == 'predictive_dynaq':
         ext = '.npy'
         base_dir = os.path.join('Ashrith', 'checkpoints')
     else:
+        # legacy neural agents are kept in the legacy checkpoint folder
         ext = '.pth'
         base_dir = os.path.join('Ashrith', 'legacy', 'checkpoints')
     return os.path.join(base_dir, f'{agent_type}_{kind}{ext}')
@@ -38,8 +40,10 @@ def get_checkpoint_path(agent_type: str, kind: str) -> str:
 
 def get_log_path(agent_type: str) -> str:
     """Return the training log path for an agent."""
+    # dynaq logs are stored in the main logs folder
     if agent_type == 'predictive_dynaq':
         return os.path.join('Ashrith', 'logs', f'{agent_type}_logs.json')
+    # legacy logs are stored with legacy artifacts
     return os.path.join('Ashrith', 'legacy', 'logs', f'{agent_type}_logs.json')
 
 
@@ -55,12 +59,13 @@ def train_reinforce(env, agent, num_episodes, eval_interval=50):
     best_reward = -float('inf')
     
     for episode in tqdm(range(num_episodes), desc="REINFORCE"):
+        # reset environment at the start of each training episode
         state, _ = env.reset()
         episode_reward = 0
         done = False
         truncated = False
         
-        # Collect full episode
+        # collect one full trajectory before update
         while not (done or truncated):
             action = agent.select_action(state, explore=True)
             next_state, reward, done, truncated, info = env.step(action)
@@ -68,7 +73,7 @@ def train_reinforce(env, agent, num_episodes, eval_interval=50):
             state = next_state
             episode_reward += reward
         
-        # Update at end of episode (Monte Carlo)
+        # reinforce update happens after full episode collection
         loss_info = agent.update()
         
         episode_rewards.append(episode_reward)
@@ -102,6 +107,7 @@ def train_a2c(env, agent, num_episodes, eval_interval=50):
     best_reward = -float('inf')
     
     for episode in tqdm(range(num_episodes), desc="A2C"):
+        # reset environment and buffers for next episode
         state, _ = env.reset()
         episode_reward = 0
         ep_losses = []
@@ -115,7 +121,7 @@ def train_a2c(env, agent, num_episodes, eval_interval=50):
             state = next_state
             episode_reward += reward
             
-            # Update every N steps or at end of episode
+            # update on fixed step interval or when episode ends
             if agent.should_update() or done or truncated:
                 loss_info = agent.update(
                     next_state=next_state, 
@@ -154,6 +160,7 @@ def train_ppo(env, agent, num_episodes, eval_interval=50):
     best_reward = -float('inf')
     
     for episode in tqdm(range(num_episodes), desc="PPO"):
+        # start one ppo rollout loop for this episode
         state, _ = env.reset()
         episode_reward = 0
         ep_losses = []
@@ -167,12 +174,12 @@ def train_ppo(env, agent, num_episodes, eval_interval=50):
             state = next_state
             episode_reward += reward
             
-            # Update when rollout buffer is full
+            # trigger ppo optimization when rollout buffer reaches target size
             if agent.should_update():
                 loss_info = agent.update(next_state=next_state)
                 ep_losses.append(loss_info['policy_loss'])
         
-        # Handle remaining transitions at end of episode
+        # process any remaining transitions after episode end
         if len(agent.buffer) > 0:
             loss_info = agent.update(next_state=next_state)
             ep_losses.append(loss_info['policy_loss'])
@@ -208,6 +215,7 @@ def train_predictive_dynaq(env, agent, num_episodes, eval_interval=50):
     best_reward = -float('inf')
 
     for episode in tqdm(range(num_episodes), desc="PredictiveDynaQ"):
+        # dynaq episode start resets predictor history
         state, _ = env.reset()
         agent.start_episode()
         episode_reward = 0.0
@@ -216,11 +224,13 @@ def train_predictive_dynaq(env, agent, num_episodes, eval_interval=50):
         truncated = False
 
         while not (done or truncated):
+            # save current action value for td change tracking
             state_key = agent._state_key(state)
             action = agent.select_action(state, explore=True)
             old_q = float(agent.q_table[state_key][action])
 
             next_state, reward, done, truncated, info = env.step(action)
+            # observe transition and run real plus planning updates
             agent.observe(
                 state=state,
                 action=action,
@@ -229,6 +239,7 @@ def train_predictive_dynaq(env, agent, num_episodes, eval_interval=50):
                 done=(done or truncated),
                 train=True,
             )
+            # track td magnitude as training stability indicator
             new_q = float(agent.q_table[state_key][action])
             td_errors.append(abs(new_q - old_q))
 
@@ -262,6 +273,7 @@ def create_agent(agent_type, state_dim, action_dim, device='cpu', seed=42):
     Note: We default to CPU because MPS has too much overhead for
     these small networks (6→128→64→2). CPU is actually faster.
     """
+    # build the selected agent type with tuned defaults for this project
     if agent_type == 'reinforce':
         return REINFORCEAgent(
             state_dim=state_dim,
@@ -313,7 +325,7 @@ def create_agent(agent_type, state_dim, action_dim, device='cpu', seed=42):
         raise ValueError(f"Unknown agent type: {agent_type}")
 
 
-def train(agent_type='reinforce', num_episodes=300, traffic_pattern='poisson', seed=42):
+def train(agent_type='reinforce', num_episodes=300, traffic_pattern='poisson', seed=42, device='cpu'):
     """
     Main training function.
     
@@ -326,13 +338,13 @@ def train(agent_type='reinforce', num_episodes=300, traffic_pattern='poisson', s
     Returns:
         (agent, rewards, losses)
     """
-    # Create directories
+    # ensure all output folders exist before training starts
     os.makedirs(os.path.join('Ashrith', 'checkpoints'), exist_ok=True)
     os.makedirs(os.path.join('Ashrith', 'logs'), exist_ok=True)
     os.makedirs(os.path.join('Ashrith', 'legacy', 'checkpoints'), exist_ok=True)
     os.makedirs(os.path.join('Ashrith', 'legacy', 'logs'), exist_ok=True)
     
-    # Create environment
+    # build one environment instance for selected traffic profile
     env = BatchingEnv(
         max_batch_size=32,
         max_wait_time=2.0,
@@ -346,10 +358,12 @@ def train(agent_type='reinforce', num_episodes=300, traffic_pattern='poisson', s
         seed=seed
     )
     
+    # infer state and action dimensions from environment
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
     
-    agent = create_agent(agent_type, state_dim, action_dim, seed=seed)
+    # create selected agent with requested device when relevant
+    agent = create_agent(agent_type, state_dim, action_dim, device=device, seed=seed)
     
     print(f"\n{'='*60}")
     print(f"Training {agent_type.upper()} Agent on {agent.device}")
@@ -357,7 +371,7 @@ def train(agent_type='reinforce', num_episodes=300, traffic_pattern='poisson', s
     print(f"Episodes: {num_episodes}")
     print(f"{'='*60}")
     
-    # Train
+    # dispatch to specific training loop for selected agent
     train_fn = {
         'reinforce': train_reinforce,
         'a2c': train_a2c,
@@ -367,10 +381,10 @@ def train(agent_type='reinforce', num_episodes=300, traffic_pattern='poisson', s
     
     rewards, losses = train_fn(env, agent, num_episodes)
     
-    # Save final model
+    # save final model artifact to configured location
     agent.save(get_checkpoint_path(agent_type, 'final'))
     
-    # Save logs
+    # persist reward and loss history for reporting and plotting
     logs = {
         'agent_type': agent_type,
         'rewards': rewards,
@@ -402,6 +416,8 @@ if __name__ == '__main__':
                         choices=['poisson', 'bursty', 'time_varying'],
                         help='Traffic pattern')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'mps', 'cuda'],
+                        help='Device for neural agents (Predictive Dyna-Q remains CPU/tabular)')
     
     args = parser.parse_args()
-    train(args.agent, args.episodes, args.traffic, args.seed)
+    train(args.agent, args.episodes, args.traffic, args.seed, args.device)

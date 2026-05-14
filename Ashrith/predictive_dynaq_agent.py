@@ -42,6 +42,7 @@ class GroupedArrivalPredictor:
         windows: Tuple[int, ...] = (2, 4, 8),
         learning_rate: float = 0.08,
     ):
+        # use grouped history windows to capture short medium and long patterns
         self.windows = windows
         self.learning_rate = learning_rate
         self.max_window = max(windows)
@@ -55,6 +56,7 @@ class GroupedArrivalPredictor:
         self._pending_features = None
 
     def _build_features(self) -> np.ndarray:
+        # build one feature vector from grouped moving averages
         values = list(self.history)
         grouped_means: List[float] = []
         for window in self.windows:
@@ -71,6 +73,7 @@ class GroupedArrivalPredictor:
         arrival-rate feature already provided by the environment.
         """
         if not self.history:
+            # use observed value before enough history is available
             return float(np.clip(fallback_value, 0.0, 1.0))
 
         features = self._build_features()
@@ -80,6 +83,7 @@ class GroupedArrivalPredictor:
 
     def update(self, observed_value: float):
         """Online SGD update using the latest observed normalized arrival rate."""
+        # update predictor weights online after each new observation
         observed_value = float(np.clip(observed_value, 0.0, 1.0))
 
         if self._pending_features is not None:
@@ -105,6 +109,7 @@ class PredictiveDynaQAgent:
         optimism_coeff: float = 0.08,
         seed: int | None = None,
     ):
+        # action space has wait and skip
         self.action_dim = action_dim
         self.device = "cpu"
         self.alpha = alpha
@@ -118,20 +123,23 @@ class PredictiveDynaQAgent:
         self.rng = random.Random(seed)
 
         self.predictor = GroupedArrivalPredictor()
+        # q table stores action values for discretized states
         self.q_table = defaultdict(self._zero_q_values)
         self.visit_counts = defaultdict(int)
+        # model stores one step transitions for planning updates
         self.model: Dict[Tuple[Tuple[int, ...], int], Tuple[float, Tuple[int, ...], bool]] = {}
 
         self.episodes_trained = 0
         self.steps_trained = 0
 
-        # 7 dimensions: 6 env features + predicted arrival feature.
+        # state has six original features plus one predicted arrival feature
         self.state_bins = (8, 8, 8, 8, 6, 6, 6)
 
     def _zero_q_values(self) -> np.ndarray:
         return np.zeros(self.action_dim, dtype=np.float32)
 
     def start_episode(self):
+        # clear predictor episode history while keeping learned weights
         self.predictor.reset()
 
     def _discretize_scalar(self, value: float, num_bins: int) -> int:
@@ -139,6 +147,7 @@ class PredictiveDynaQAgent:
         return min(num_bins - 1, int(value * num_bins))
 
     def _state_key(self, state: np.ndarray, predicted_arrival: float | None = None) -> Tuple[int, ...]:
+        # combine observed state and predicted demand into one discretized key
         if predicted_arrival is None:
             predicted_arrival = self.predictor.predict(float(state[4]))
 
@@ -149,12 +158,14 @@ class PredictiveDynaQAgent:
         )
 
     def select_action(self, state: np.ndarray, explore: bool = True) -> int:
+        # epsilon controls exploration during training
         state_key = self._state_key(state)
         q_values = self.q_table[state_key]
 
         if explore and self.rng.random() < self.epsilon:
             return self.rng.randrange(self.action_dim)
 
+        # optimism bonus encourages trying less visited actions
         bonuses = np.array(
             [
                 self.optimism_coeff / np.sqrt(self.visit_counts[(state_key, action)] + 1)
@@ -172,6 +183,7 @@ class PredictiveDynaQAgent:
         next_state_key: Tuple[int, ...],
         done: bool,
     ):
+        # standard temporal difference update
         current_q = self.q_table[state_key][action]
         best_next_q = 0.0 if done else float(np.max(self.q_table[next_state_key]))
         td_target = reward + self.gamma * best_next_q
@@ -194,17 +206,20 @@ class PredictiveDynaQAgent:
         """
         state_key = self._state_key(state)
 
+        # always keep predictor updated even during evaluation
         self.predictor.update(float(next_state[4]))
         next_state_key = self._state_key(next_state)
 
         if not train:
             return
 
+        # learn from real transition
         self._q_update(state_key, action, reward, next_state_key, done)
         self.visit_counts[(state_key, action)] += 1
         self.model[(state_key, action)] = (reward, next_state_key, done)
         self.steps_trained += 1
 
+        # run planning updates from stored model transitions
         if self.model:
             model_keys = list(self.model.keys())
             for _ in range(self.planning_steps):
@@ -213,10 +228,12 @@ class PredictiveDynaQAgent:
                 self._q_update(sim_state_key, sim_action, sim_reward, sim_next_state_key, sim_done)
 
     def end_episode(self):
+        # decay exploration after each episode
         self.episodes_trained += 1
         self.epsilon = max(self.epsilon_end, self.epsilon * self.epsilon_decay)
 
     def save(self, filepath: str):
+        # save all learner state for reproducible reloads
         payload = {
             "q_table": dict(self.q_table),
             "visit_counts": dict(self.visit_counts),
@@ -230,6 +247,7 @@ class PredictiveDynaQAgent:
         np.save(filepath, payload, allow_pickle=True)
 
     def load(self, filepath: str):
+        # restore all learner state from saved payload
         payload = np.load(filepath, allow_pickle=True).item()
         self.q_table = defaultdict(self._zero_q_values)
         for state_key, q_values in payload["q_table"].items():

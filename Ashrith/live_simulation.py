@@ -12,11 +12,12 @@ from Ashrith.env import BatchingEnv
 from Ashrith.predictive_dynaq_agent import PredictiveDynaQAgent
 
 def run_live_simulation():
-    # Setup environment
+    # define rate scaling used for predicted and observed demand plot
     MAX_RATE_MULTIPLIER = 3.0
     BASE_RATE = 5.0
     MAX_RATE = BASE_RATE * MAX_RATE_MULTIPLIER
     
+    # create environment with time varying traffic to show adaptation behavior
     env = BatchingEnv(
         traffic_pattern='time_varying', # Uses time_varying to make pred vs obs interesting
         base_arrival_rate=BASE_RATE,
@@ -27,7 +28,7 @@ def run_live_simulation():
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.n
 
-    # Setup agent
+    # create inference agent and load selected checkpoint when available
     agent = PredictiveDynaQAgent(action_dim=action_dim)
     ckpt_path = os.path.join('Ashrith', 'checkpoints', 'predictive_dynaq_best.npy')
     
@@ -40,10 +41,10 @@ def run_live_simulation():
     agent.start_episode()
     state, _ = env.reset()
 
-    # Enable interactive mode for matplotlib
+    # enable live plotting mode
     plt.ion()
     
-    # Create the figure
+    # build four panel dashboard for latency batching and demand prediction
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     try:
         fig.canvas.manager.set_window_title("Live Simulation: Predictive Dyna-Q")
@@ -52,7 +53,7 @@ def run_live_simulation():
         
     ax_wait, ax_p95, ax_batch, ax_pred = axes.flatten()
 
-    # Use deques to store the plotted data over time (sliding window)
+    # keep a sliding history so plots remain readable
     MAX_HISTORY = 300
     steps = collections.deque(maxlen=MAX_HISTORY)
     wait_times = collections.deque(maxlen=MAX_HISTORY)
@@ -61,7 +62,7 @@ def run_live_simulation():
     pred_rates = collections.deque(maxlen=MAX_HISTORY)
     obs_rates = collections.deque(maxlen=MAX_HISTORY)
 
-    # Initialize empty plot lines
+    # initialize plot line objects that will be updated each step
     line_wait, = ax_wait.plot([], [], color='#e74c3c', lw=2)
     ax_wait.set_title('Avg Wait Time', fontsize=12)
     ax_wait.set_xlabel('Step')
@@ -89,7 +90,8 @@ def run_live_simulation():
     for ax in axes.flatten():
         ax.grid(alpha=0.3)
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.90]) # Leave room for suptitle
+    # reserve top area for live text metrics
+    plt.tight_layout(rect=[0, 0.03, 1, 0.90])
     plt.show(block=False)
 
     done = False
@@ -100,19 +102,18 @@ def run_live_simulation():
     plt.pause(2.0)  # brief pause before starting
 
     while not (done or truncated) and plt.fignum_exists(fig.number):
-        # Determine predicted arrival rate
-        # state[4] is the normalized observed rate
+        # compute predicted raw demand from normalized observation
         normalized_obs_rate = float(state[4])
         normalized_pred_rate = agent.predictor.predict(normalized_obs_rate)
         pred_rate_raw = normalized_pred_rate * MAX_RATE
 
-        # Let agent select an action based on policy (no exploration)
+        # run greedy action selection for stable live demo behavior
         action = agent.select_action(state, explore=False)
         action_str = "SKIP" if action == 1 else "WAIT"
         
         next_state, reward, done, truncated, info = env.step(action)
         
-        # Observe the transition (eval: Predictive Dyna-Q only updates its predictor)
+        # keep predictor updates active during evaluation loop
         agent.observe(
             state=state,
             action=action,
@@ -125,7 +126,7 @@ def run_live_simulation():
         state = next_state
         step += 1
 
-        # Record metrics
+        # collect metrics for live rendering
         metrics = env.get_metrics()
         
         steps.append(step)
@@ -135,9 +136,9 @@ def run_live_simulation():
         pred_rates.append(pred_rate_raw)
         obs_rates.append(info['arrival_rate'])
 
-        # Update plots every N steps to keep drawing smooth
+        # update figure every two steps for smoother rendering
         if step % 2 == 0:
-            # Update Title with Live Text Counters
+            # show key counters at top of dashboard
             total_reqs = metrics.get('total_requests', 0)
             total_batches = metrics.get('total_batches', 0)
             throughput = metrics.get('throughput', 0.0)
@@ -152,7 +153,7 @@ def run_live_simulation():
             )
             fig.suptitle(title_text, fontsize=14, fontweight='bold', color='black')
 
-            # Update data
+            # refresh all plotted series
             list_steps = list(steps)
             line_wait.set_data(list_steps, list(wait_times))
             ax_wait.relim()
@@ -171,16 +172,16 @@ def run_live_simulation():
             ax_pred.relim()
             ax_pred.autoscale_view()
 
-            # Refresh the canvas
+            # draw current frame
             fig.canvas.draw()
             fig.canvas.flush_events()
             
-            # Short pause to control simulation playback speed (approx 50 steps/second)
+            # add small delay to keep playback speed readable
             time.sleep(0.02)
 
     print("Simulation stopped.")
     
-    # Disable interactive mode and block the script so user can inspect the final plot
+    # switch back to blocking mode so final frame remains visible
     plt.ioff()
     plt.show()
 
