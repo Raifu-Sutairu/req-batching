@@ -60,8 +60,8 @@ export const options = {
 };
 
 const PROXY_URL = "http://localhost:8080/api/resource";
-// Prometheus metrics endpoint — scrape before and after to diff flush counts
-const METRICS_URL = "http://localhost:9091/metrics";
+// Prometheus HTTP API — query batch_flush_total counter
+const PROM_API = "http://localhost:9091/api/v1/query";
 
 export default function () {
   const res = http.get(PROXY_URL);
@@ -71,19 +71,22 @@ export default function () {
 }
 
 export function handleSummary(data) {
-  // Scrape Prometheus to get actual upstream flush count
-  const metricsRes = http.get(METRICS_URL);
+  // Query Prometheus HTTP API for batch_flush_total
+  const queryRes = http.get(`${PROM_API}?query=sum(batch_flush_total)`);
   let flushCount = 0;
 
-  if (metricsRes.status === 200) {
-    const lines = metricsRes.body.split("\n");
-    for (const line of lines) {
-      // Sum all flush reasons to get total upstream calls made
-      if (line.startsWith("batch_flush_total{") && !line.startsWith("#")) {
-        const match = line.match(/} (\d+(\.\d+)?)/);
-        if (match) flushCount += parseFloat(match[1]);
+  if (queryRes.status === 200) {
+    try {
+      const body = JSON.parse(queryRes.body);
+      const result = body.data.result;
+      if (result && result.length > 0) {
+        flushCount = parseFloat(result[0].value[1]);
       }
+    } catch (e) {
+      console.log("Could not parse Prometheus response:", e.message);
     }
+  } else {
+    console.log("Prometheus query failed, status:", queryRes.status);
   }
 
   const sentRequests = data.metrics.total_requests.values.count;

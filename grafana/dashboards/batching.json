@@ -8,48 +8,144 @@
   },
   "panels": [
     {
-      "title": "Batch Flush Total (by reason)",
+      "id": 1,
+      "title": "Batch Flush Rate (by reason)",
       "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (reason) (rate(batch_flush_total[$__rate_interval]))",
           "legendFormat": "{{reason}}"
         }
       ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "lineWidth": 2 }
+        }
+      },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 }
     },
     {
+      "id": 2,
       "title": "Active Batch Slots",
       "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "active_batch_slots",
           "legendFormat": "Active Slots"
         }
       ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 100 }
+            ]
+          }
+        }
+      },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 }
     },
     {
+      "id": 3,
       "title": "Batch Size at Flush (Distribution)",
       "type": "barchart",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (le) (increase(batch_size_at_flush_bucket[$__rate_interval]))",
-          "legendFormat": "{{le}}"
+          "legendFormat": "≤{{le}}"
         }
       ],
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
     },
     {
-      "title": "Batch Age MS at Flush (Distribution)",
+      "id": 4,
+      "title": "Batch Age (ms) at Flush (Distribution)",
       "type": "barchart",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
           "expr": "sum by (le) (increase(batch_age_ms_at_flush_bucket[$__rate_interval]))",
-          "legendFormat": "{{le}}"
+          "legendFormat": "≤{{le}}ms"
         }
       ],
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "id": 5,
+      "title": "Total Flushes Cumulative",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(batch_flush_total)",
+          "legendFormat": "Total Flushes"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 16 }
+    },
+    {
+      "id": 6,
+      "title": "Avg Batch Size",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(batch_size_at_flush_sum) / sum(batch_size_at_flush_count)",
+          "legendFormat": "Avg Batch Size"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short", "decimals": 2 }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 16 }
+    },
+    {
+      "id": 7,
+      "title": "Avg Batch Age (ms)",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(batch_age_ms_at_flush_sum) / sum(batch_age_ms_at_flush_count)",
+          "legendFormat": "Avg Age ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "decimals": 1 }
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 16 }
+    },
+    {
+      "id": 8,
+      "title": "Flush Reason Split (%)",
+      "type": "piechart",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (reason) (batch_flush_total)",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 16 }
     }
   ],
   "schemaVersion": 38

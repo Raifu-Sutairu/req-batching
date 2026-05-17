@@ -19,3 +19,6 @@ rl/venv/*
 venv/
 __pycache__/
 rl/proto_out/
+
+# k6 raw NDJSON results (large files — keep summary JSONs only)
+tests/k6/results/*_raw.json

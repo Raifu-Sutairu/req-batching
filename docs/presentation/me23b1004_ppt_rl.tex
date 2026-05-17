@@ -1,0 +1,266 @@
+\documentclass[aspectratio=169]{beamer}
+\usetheme{Madrid}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{amsmath}
+
+\definecolor{accent}{RGB}{76,175,80}
+\setlength{\columnsep}{1em}
+
+\setbeamertemplate{footline}{}
+
+\lstset{
+  basicstyle=\tiny\ttfamily\color{white},
+  backgroundcolor=\color{black!90},
+  keywordstyle=\color{accent},
+  commentstyle=\color{gray},
+  stringstyle=\color{orange},
+  breaklines=true,
+  frame=single,
+  rulecolor=\color{gray}
+}
+
+\title{RL-Driven Request Batching Reverse Proxy}
+\subtitle{Replacing Static Timers with a PPO Reinforcement Learning Agent}
+\institute{Course: Reinforcement Learning (CS3009)}
+\author{
+  R Abinav (ME23B1004) \\
+  Sudarshan S (CS23B2007) \\
+  Chris Jason (CS23B1012) \\
+  Shirish Giroti (CS23B2041) \\
+  Ashrith Yathin (CS23B2006) \\
+  \vspace{0.5em}
+  \texttt{\small https://github.com/Raifu-Sutairu/req-batching}
+}
+\date{}
+
+\begin{document}
+
+\begin{frame}
+  \maketitle
+\end{frame}
+
+\begin{frame}{The Problem: Every Request Hits the Upstream}
+\small
+\begin{columns}[T]
+\begin{minipage}[t]{0.47\textwidth}
+\textbf{Without Batching}
+\begin{itemize}
+  \small
+  \item Each client request triggers one upstream call independently
+  \item Under bursty traffic, N simultaneous requests = N upstream calls
+  \item Upstream bears full load with no coalescing
+  \item Static workarounds (fixed timer, size cap) are blind to traffic state
+  \item gzip middleware silently invalidates \texttt{ETag} headers, forcing every conditional request (\texttt{If-None-Match}) to hit upstream with no cache benefit.
+\end{itemize}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.47\textwidth}
+\textbf{With Intelligent Batching}
+\begin{itemize}
+  \small
+  \item Concurrent requests to the same endpoint are parked in a shared slot
+  \item One upstream call serves N waiting clients
+  \item Flush timing adapts to queue depth, arrival rate, and backend health
+  \item The question is not whether to batch - it is \textit{when} to flush
+\end{itemize}
+\end{minipage}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Related Work \& Inspiration}
+\small
+\begin{itemize}
+  \item \textbf{1. Cloudflare "Sometimes I Cache" (2024)} \\
+  Exponential urgency formula $p(t) = e^{-\lambda \cdot \text{remaining}}$ is optimal for age only decisions. We extend this to a 4 signal observation space conditioning on queue depth and arrival rate.
+  
+  \vspace{0.6em}
+  \item \textbf{2. Cold RL, Bhayani, arXiv:2508.12485 (2025)} \\
+  Offline RL for NGINX cache eviction via DQN + ONNX sidecar + 500$\mu$s hard timeout + LRU fallback. Directly validates our offline first training, ONNX serving, and hard deadline fallback pattern.
+  
+  \vspace{0.6em}
+  \item \textbf{3. IEEE 10740859} \\
+  Entropy regularisation in PPO prevents policy collapse to always WAIT or always FLUSH. Directly motivated our exploration strategy ($\beta = 0.01$ entropy coefficient).
+  
+  \vspace{0.6em}
+  \item \textbf{4. Sarathi Serve, Agrawal et al., OSDI 2024} \\
+  Same throughput and latency tradeoff in LLM inference batching. Different domain (GPU inference vs HTTP proxy), same core tension, validates the problem framing.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Reverse Proxy Architecture}
+\begin{center}
+  \includegraphics[width=0.85\textwidth,height=0.8\textheight,keepaspectratio]{rev_proxy_architecture.png}
+\end{center}
+\end{frame}
+
+\begin{frame}{Our Solution: A Rust Reverse Proxy with RL Flush Control}
+\small
+\begin{columns}[T]
+\begin{column}{0.33\textwidth}
+\textbf{Request Flow}
+\begin{itemize}
+  \item TCP connection accepted via Tokio listener
+  \item Semaphore caps max concurrent connections
+  \item Router fingerprints request: GET \texttt{->} batch, non-GET \texttt{->} pass-through
+\end{itemize}
+\end{column}
+\begin{column}{0.33\textwidth}
+\textbf{Batching Engine}
+\begin{itemize}
+  \item DashMap registry groups requests by endpoint key
+  \item Incoming request parks via \texttt{oneshot} channel
+  \item Timer task spawned once per BatchSlot on creation
+\end{itemize}
+\end{column}
+\begin{column}{0.33\textwidth}
+\textbf{Flush Decision}
+\begin{itemize}
+  \item Hard limits checked unconditionally first
+  \item RL Agent queried only inside safe envelope
+  \item Fan-out: \texttt{mem::take} drains senders, all clients receive response simultaneously
+\end{itemize}
+\end{column}
+\end{columns}
+
+\vspace{1em}
+\begin{center}
+\textcolor{accent}{Written in Rust - Tokio + Hyper + DashMap. Zero lock contention across concurrent endpoints.}
+\end{center}
+\end{frame}
+
+\begin{frame}{System Architecture}
+\begin{center}
+  \includegraphics[width=0.78\textwidth]{Architecture_Diagram.png}
+\end{center}
+
+\vspace{0.5em}
+\begin{center}
+\small
+\textcolor{accent}{\textbullet} Rust: Tokio + Hyper \quad
+\textcolor{accent}{\textbullet} Kafka to offline PPO to ONNX gRPC sidecar \quad
+\textcolor{accent}{\textbullet} Redis deduplicates within batch before upstream
+\end{center}
+\end{frame}
+
+\begin{frame}{RL Algorithm: MDP Formulation}
+\begin{columns}[T]
+\begin{minipage}[c]{0.44\textwidth}
+  \vfill
+  \begin{center}
+    \includegraphics[width=\linewidth]{../../MDP_Plot.png}
+  \end{center}
+  \vfill
+\end{minipage}
+\hfill
+\begin{minipage}[c]{0.52\textwidth}
+  \small
+  \begin{tabular}{l p{4.8cm}}
+  \toprule
+  \textbf{Component} & \textbf{Definition} \\
+  \midrule
+  \textbf{State} $s$ & $[\,\text{batch\_size}/128,\ \text{age\_ms}/50,$\newline
+$\log_{1p}(\text{p99})/\log_{1p}(500),$\newline
+$\tanh(\text{rate}/100)\,]$ \\
+  \textbf{Action} $a$ & $\{0 = \textsc{wait},\ 1 = \textsc{flush}\}$ \newline binary decision per incoming request \\
+  \textbf{Reward} $r$ & $\log_2(1+\text{sz}) + \text{urgency}$\newline
+$- \beta\cdot\text{upstream\_penalty}$\newline
+$- \gamma\cdot\mathbb{1}[\text{forced}]$ \\
+  \bottomrule
+  \end{tabular}
+  
+  \vspace{0.5em}
+  \begin{itemize}
+    \item Episode = one BatchSlot lifetime, from first request arrival to flush.
+    \item Agent is queried on every request \textit{within} the safety envelope - hard limits fire unconditionally first.
+  \end{itemize}
+\end{minipage}
+\end{columns}
+\end{frame}
+
+\begin{frame}{RL Algorithm: Why PPO with Offline Pre-training?}
+\small
+\begin{columns}[T]
+\begin{column}{0.58\textwidth}
+  \textbf{Algorithm Selection}
+  
+  \vspace{0.5em}
+  \begin{tabular}{lp{4.2cm}}
+  Not DQN & Experience replay not suited to per-request sub-5ms decision frequency \\
+  Not plain PPO & On-policy only; wastes heuristic telemetry from before agent exists \\
+  PPO + Offline \checkmark & Warm-start from Kafka replays; entropy bonus $\beta=0.01$ prevents degenerate policy collapse \\
+  \end{tabular}
+\end{column}
+\begin{column}{0.4\textwidth}
+  \textbf{Network Architecture}
+  \begin{itemize}
+    \small\ttfamily
+    \item Input: obs [4]
+    \item Linear(4 -> 64) + LayerNorm + ReLU
+    \item Linear(64 -> 64) + LayerNorm + ReLU
+    \item Linear(64 -> 2): WAIT or FLUSH logits
+    \item Categorical distribution -> action
+  \end{itemize}
+\end{column}
+\end{columns}
+
+\vspace{1em}
+\begin{itemize}
+  \item Separate actor and critic networks - no shared layers (non-stationary reward scale).
+  \item Trained offline on Kafka \texttt{batch-telemetry}, exported to ONNX, served via gRPC sidecar at $<$1ms inference.
+\end{itemize}
+\end{frame}
+
+\begin{frame}{Results: Latency Profile Across Policies}
+\begin{columns}[T]
+\begin{column}{0.60\textwidth}
+  \includegraphics[width=\linewidth]{chart_1_latency_scatter.png}
+\end{column}
+\begin{column}{0.36\textwidth}
+  \textcolor{accent}{\textbf{Key:}}
+  \begin{itemize}
+    \small
+    \item PPO: lower p50 (43ms vs 51ms) with identical p99 ceiling of 63ms. Hard timeout enforces the ceiling unconditionally.
+    \item Fixed Size Cap without a timer: p99 blows to 4056ms under sparse traffic. This is the exact failure mode the safety envelope prevents.
+    \item Bottom-left is best. PPO is closer to that corner than any batching policy.
+  \end{itemize}
+\end{column}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Results: Upstream Reduction vs Mean Batch Size}
+\begin{columns}[T]
+\begin{column}{0.60\textwidth}
+  \includegraphics[width=\linewidth]{chart_2_efficiency_frontier.png}
+\end{column}
+\begin{column}{0.36\textwidth}
+  \begin{itemize}
+    \small
+    \item PPO: 97.39\% upstream reduction with 14\% smaller mean batches than Fixed Timer. Flushes early when justified, not when the clock runs out.
+    \item Cloudflare age-only policy achieves 82.16\%. The gap is explained by conditioning on \texttt{request\_rate} and \texttt{upstream\_p99}, signals unavailable to a single-signal policy.
+    \item High reduction and small batches together mean less upstream load and lower median latency simultaneously.
+  \end{itemize}
+\end{column}
+\end{columns}
+\end{frame}
+
+\begin{frame}{Results: Median Latency \& Safety Envelope Validation}
+\begin{columns}[T]
+\begin{column}{0.5\textwidth}
+  \includegraphics[width=\linewidth]{chart_3_p50_viable.png}
+  
+  \vspace{0.2em}
+  \tiny Agent flushes early when smart to - 14.6\% lower median latency than fixed 50ms timer.
+\end{column}
+\begin{column}{0.5\textwidth}
+  \includegraphics[width=\linewidth]{chart_4_forced_flush.png}
+  
+  \vspace{0.2em}
+  \tiny PPO: 0\% forced flush rate. Fixed Size Cap: 93.5\% - stalls under sparse traffic without a timer fallback.
+\end{column}
+\end{columns}
+\end{frame}
+
+\end{document}

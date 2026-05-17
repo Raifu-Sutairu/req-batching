@@ -28,6 +28,7 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
 import { Trend, Rate } from "k6/metrics";
+import exec from "k6/execution";
 
 // Separate trends for sparse vs burst phases
 const sparsLatency = new Trend("sparse_latency_ms", true);
@@ -66,7 +67,7 @@ export const options = {
 const PROXY_URL = "http://localhost:8080/api/resource";
 
 export default function (data) {
-  const phase = __ENV.K6_SCENARIO_NAME || "unknown";
+  const phase = exec.scenario.name;
   const res = http.get(PROXY_URL);
 
   if (phase === "sparse_phase") {
