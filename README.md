@@ -11,9 +11,10 @@
 - [7. Conclusion](#7-conclusion)
 - [8. Future Work](#8-future-work)
 - [9. Project Layout](#9-project-layout)
-- [10. Getting Started](#10-getting-started)
-- [11. Authors and their contributions](#11-authors)
-- [12. License](#12-license)
+- [10. Observability & Benchmarks](#10-observability--benchmarks)
+- [11. Getting Started](#11-getting-started)
+- [12. Authors and their contributions](#12-authors)
+- [13. License](#13-license)
 
 ## 2. Introduction
 
@@ -95,30 +96,83 @@ We built a Rust reverse proxy with a PPO-driven request coalescing agent to opti
 
 ## 8. Future Work
 
-- k6 load testing
-- online fine-tuning
-- multi-endpoint routing config
+- online fine-tuning from live production telemetry
+- multi-endpoint routing config (per-path batch policies)
 - ablation studies (reward component analysis)
+- RL agent hot-reload without proxy restart
 
 ## 9. Project Layout
 
 ```
 req-batching/
-|-- reverse-proxy/          # Core proxy engine
+|-- reverse-proxy/              # Core proxy engine (Rust)
 |   |-- Cargo.toml
 |   |-- src/
-|       |-- main.rs         # Entry point - wires Config, AppState, listener
-|       |-- config.rs       # Configuration struct (addr, timeouts, limits)
-|       |-- state.rs        # Shared AppState - DashMap batch registry
-|       |-- batch.rs        # BatchKey, BatchState, BatchSlot, channel types
-|       |-- router.rs       # RoutingDecision - Batch or PassThrough
-|       |-- listener.rs     # TCP accept loop, semaphore, graceful shutdown
-|       |-- service.rs      # Hyper HTTP handler, batching engine, serve_batch
-|-- rl/                     # PPO agent, Gymnasium environment, gRPC server
-|-- docs/                   # Design notes
+|       |-- main.rs             # Entry point — wires Config, AppState, listener
+|       |-- config.rs           # Configuration struct (addr, timeouts, limits)
+|       |-- state.rs            # Shared AppState — DashMap batch registry
+|       |-- batch.rs            # BatchKey, BatchState, BatchSlot, channel types
+|       |-- router.rs           # RoutingDecision — Batch or PassThrough
+|       |-- listener.rs         # TCP accept loop, semaphore, graceful shutdown
+|       |-- service.rs          # Hyper HTTP handler, batching engine, serve_batch
+|       |-- metrics.rs          # Prometheus counters/histograms/gauges
+|       |-- telemetry.rs        # Kafka flush-event publisher
+|       |-- cache.rs            # Redis response deduplication layer
+|-- rl/                         # PPO agent, Gymnasium env, gRPC sidecar
+|-- tests/
+|   |-- k6/                     # k6 load test suite (4 tests)
+|       |-- 01_latency_under_load.js
+|       |-- 02_upstream_reduction.js
+|       |-- 03_breaking_point.js
+|       |-- 04_rl_vs_fixed_timer.js
+|       |-- run_all.sh
+|       |-- results/            # Summary JSONs from last run
+|-- grafana/                    # Pre-provisioned Grafana dashboard
+|-- prometheus.yml              # Prometheus scrape config
+|-- docker-compose.yml          # Full stack: proxy + RL + Kafka + Redis + Prometheus + Grafana
+|-- docs/
+|   |-- metrics/                # Benchmark results & charts (see §10)
+|   |-- plots/                  # Offline evaluation charts
 ```
 
-## 10. Getting Started
+## 10. Observability & Benchmarks
+
+The proxy exports Prometheus metrics at `:9090/metrics` (internal). When running via `docker compose`, Prometheus scrapes every 2 s and Grafana auto-provisions a live dashboard.
+
+| Service | Host URL | Notes |
+|---------|----------|-------|
+| Grafana dashboard | <http://localhost:3000> | Anonymous viewer, no login |
+| Prometheus | <http://localhost:9091> | Query API at `/api/v1/query` |
+| Proxy metrics | `reverse-proxy:9090/metrics` | Prometheus text format (internal) |
+
+### Exported metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `batch_flush_total` | Counter | `reason` | Flush events by reason (`Timeout` / `SizeCap` / `RlAgent`) |
+| `batch_size_at_flush` | Histogram | `reason` | Requests coalesced per upstream call |
+| `batch_age_ms_at_flush` | Histogram | `reason` | Batch lifetime in ms at flush time |
+| `active_batch_slots` | Gauge | — | Currently open batch slots |
+
+### k6 Load Test Results (measured 2026-05-17)
+
+Run with `bash tests/k6/run_all.sh` after `docker compose up -d`. Full results and charts: **[docs/metrics/README.md](docs/metrics/README.md)**
+
+| Test | Scope | Key result |
+|------|-------|------------|
+| [1] Latency Under Load | 0→150 VUs | p50=54ms · p99=84ms · **0.00% errors** ✅ |
+| [2] Upstream Reduction | 5-wave burst (50 VUs) | 34,357 reqs → 14,458 flushes · **~57.9% reduction** |
+| [3] Breaking Point | 0→800 VUs step ramp | 474,699 reqs · **0.00% errors** · p99 cliff at ~400–600 VUs |
+| [4] RL vs Fixed-Timer | Sparse + burst phases | Burst p99=57ms (**beats 65ms target**) · Sparse p50 ~22ms vs 50ms fixed ✅ |
+
+![k6 Benchmark Summary](docs/metrics/k6_benchmark_summary.png)
+
+![Prometheus Live Metrics](docs/metrics/prometheus_live_metrics.png)
+
+> **Flush reason breakdown (post all k6 tests):**  
+> `Timeout` 13,888 (96.1%, avg batch=41.5) · `SizeCap` 567 (3.9%, avg batch=126.5) · `RlAgent` 3 (0.02%, avg batch=51)
+
+## 11. Getting Started
 
 ### Clone
 
@@ -127,13 +181,15 @@ git clone https://github.com/Raifu-Sutairu/req-batching.git
 cd req-batching
 ```
 
-### Build and Run
+### Build and Run (full observability stack)
 
 To ensure consistency and ease of use, we recommend using Docker to build and run the reverse proxy and RL sidecar.
 
 ```bash
-docker-compose up --build
-# Listening on 127.0.0.1:8080
+docker compose up -d --build
+# Proxy:      http://localhost:8080
+# Prometheus: http://localhost:9091
+# Grafana:    http://localhost:3000  (anonymous viewer)
 ```
 
 ### Verify batching
@@ -174,7 +230,7 @@ let config = Arc::new(config::Config {
 | `batch_timeout_ms` | Maximum time a batch is held open |
 | `max_batch_size` | Maximum requests per batch before early flush |
 
-## 11. Authors
+## 12. Authors
 
 1. R Abinav (ME23B1004) - Code, contribution present on [`main` branch](https://github.com/Raifu-Sutairu/req-batching/tree/main)
 2. Sudarshan S (CS23B2007) - Code, contribution present on [`sudarshan` branch](https://github.com/Raifu-Sutairu/req-batching/tree/sudarshan)
@@ -182,6 +238,6 @@ let config = Arc::new(config::Config {
 4. Shirish Giroti (CS23B2041) - Code, contribution present on [`feature/sac-lstm-per` branch](https://github.com/Raifu-Sutairu/req-batching/tree/feature/sac-lstm-per)
 5. Ashrith Yathin (CS23B2006) - Code, contribution present on [`ashrith` branch](https://github.com/Raifu-Sutairu/req-batching/tree/ashrith)
 
-## 12. License
+## 13. License
 
 This project is licensed under the MIT License. See [LICENSE](./LICENSE) for the full text.
